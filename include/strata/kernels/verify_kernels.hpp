@@ -100,6 +100,8 @@ void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_e
 void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t* count, void* stream);
 /// The draft chain's next input: R_dst[:] = R_src[row], tok_dst[0] = ids[row], out[j] = ids[row], with
 /// row = *row_dev (device memory).  `out` may be mapped host memory.
+/// The drafter's chain, teacher forced: `*tok = force[j]` when force[j] >= 0 (mapped, read at run time), else unchanged.
+void force_token(int32_t* tok, const int32_t* force, int j, void* stream);
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs = nullptr,
                 float* out_p = nullptr);

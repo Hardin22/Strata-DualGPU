@@ -49,6 +49,7 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
@@ -63,7 +64,12 @@ public:
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.
-    bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
+    bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
+                 bool sync = true);
+    /// --pipeline-windows: capture the prefill graphs and size the prefill records for windows of up to max_t rows
+    /// now, so a later prefill(sync = false) neither captures nor allocates (both would wait for the device).
+    bool prepare_prefill(std::string& err);
+    cudaStream_t stream() const { return cs_; }
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
@@ -90,6 +96,41 @@ public:
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     bool coupled() const { return coupled_active_; }
 
+    /// STRATA_SHADOW_CHAIN (measurement only): after the drafts of each round, continue the chain to `n` outputs in
+    /// total, whatever their probability; the extra outputs never reach a window (drafts and probs are unchanged), and
+    /// the cells the extra steps write lie past the window, overwritten before anything reads them (see above).
+    void set_shadow(int n) { shadow_total_ = n; }
+
+    // ---- --pipeline-windows 2: the chain as one asynchronous launch (round + steps back to back, no host sync), its
+    // first `n_force` steps fed the given tokens instead of their own picks (teacher forcing: the drafts of a window
+    // already in flight), the outputs read once its event has completed.
+    /// Before the first capture: the round/step graphs get the forcing kernel (a no-op while force[j] < 0).
+    void set_force_capture(bool on) { force_on_ = on; }
+    /// The rows the next round reads, copied into the bound buffer first (when they live elsewhere).
+    void set_source_R(const float* rows) { src_R_ = rows; }
+    /// Capture the round graphs for T = 1..max_t and every step graph now (a capture syncs the drafter's stream).
+    bool prepare_chain(std::string& err);
+    /// `n_early` (0: none): an extra event after that many outputs, polled by chain_early_poll.
+    /// `n_headless`: steps 1..n_headless run without the head (their outputs read as -1): forced steps whose pick
+    /// only serves as an agreement signal, ~0.15-0.2 ms each of the drafter's card.
+    bool chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force, int n_out,
+                      int n_early, std::string& err, int n_headless = 0);
+    /// 1: the outputs are in chain_tok()/chain_prob(); 0: still running; -1: error.
+    int chain_poll(std::string& err);
+    /// 1: the first `n_early` outputs are in chain_tok()/chain_prob() (the rest still running); 0: not yet; -1: error.
+    int chain_early_poll(std::string& err);
+    /// How many of the chain's first outputs (up to `n_early`; all of them once the chain is done) have landed:
+    /// they are in chain_tok()/chain_prob().  -1: error.  A fresh window's size is often decided by its first outputs
+    /// (a draft below spec_min_p ends it), so its stage-0 launch need not wait for all `n_early`.
+    int chain_outputs_ready(std::string& err);
+    bool chain_live() const { return chain_live_; }
+    const int32_t* chain_tok() const { return chain_tok_; }
+    const float* chain_prob() const { return chain_prob_; }
+    cudaEvent_t chain_event() const { return ev_chain_; }
+    int shadow_n() const { return shadow_n_; }
+    const int32_t* shadow_tok() const { return shadow_tok_; }
+    const float* shadow_prob() const { return shadow_prob_; }
+
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
 
@@ -112,6 +153,7 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
+    bool capture_step_forced(int j, std::string& err);   ///< a forced step without the head (its hidden, the token)
     cudaGraphExec_t step_exec_[9] = {};
     // TRIMS (STRATA_MTP_CHAIN, default on): the round and every chain step in ONE graph, step j behind a conditional
     // node that runs it only while drafts 0..j-1 all reached min_p (a mapped float the host sets per round) - the
@@ -130,6 +172,9 @@ private:
     bool chain_failed_ = false;           ///< a capture failed once: the per-step graphs from then on
     cudaStream_t cs2_ = nullptr;          ///< the conditional bodies are captured on it
     float *h_minp_ = nullptr, *m_minp_ = nullptr;
+    cudaGraphExec_t step_forced_exec_[9] = {};
+    bool skip_head_ = false;
+    int chain_headless_ = 0;
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
@@ -153,6 +198,19 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
+    int shadow_total_ = 0, shadow_n_ = 0;
+    bool force_on_ = false, chain_live_ = false;
+    const float* src_R_ = nullptr;
+    int32_t *h_force_ = nullptr, *m_force_ = nullptr;
+    cudaEvent_t ev_chain_ = nullptr, ev_early_ = nullptr;
+    cudaEvent_t ev_step_[8] = {};      ///< after each of the first n_early outputs
+    int steps_seen_ = 0;
+    int chain_n_ = 0, chain_early_ = 0;
+    bool early_live_ = false;
+    int32_t chain_tok_[8] = {};
+    float chain_prob_[8] = {};
+    int32_t shadow_tok_[8] = {};
+    float shadow_prob_[8] = {};
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;

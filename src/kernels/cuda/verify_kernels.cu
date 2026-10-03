@@ -294,6 +294,11 @@ __global__ void mtp_select_kernel(const float* __restrict__ R_src, int64_t strid
     }
 }
 
+__global__ void force_token_kernel(int32_t* tok, const int32_t* force, int j) {
+    const int32_t f = ((const volatile int32_t*) force)[j];
+    if (f >= 0) *tok = f;
+}
+
 __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int32_t* __restrict__ steps) {
     const int i = threadIdx.x;
     if (i >= n) return;
@@ -328,6 +333,11 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
     if (n < 1 || n > 1024) { std::fprintf(stderr, "ident_hits: n out of range\n"); std::exit(1); }
     ident_hits_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(ids, n, slot, dst, count);
     check("ident_hits");
+}
+
+void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {
+    force_token_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(tok, force, j);
+    check("force_token");
 }
 
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,

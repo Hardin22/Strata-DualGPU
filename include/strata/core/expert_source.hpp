@@ -459,6 +459,9 @@ public:
     uint8_t* exchange_buffer(int64_t q) const;
     /// Requires `has_resident(layer, in)`, `!has_resident(layer, out)` and `exchange_buffer(q)` holding out's blob.
     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
+    /// --pipeline-windows: size the exchange table now, so a `stage_exchange` on the adaptive tier's thread never
+    /// reallocates it under a concurrent `blob`.
+    void prepare_overrides() { if (override_.empty()) override_.assign((size_t) blobs_, nullptr); }
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
     int64_t commit_exchanges();
     /// TRIMS: `commit_exchanges` in two halves.  `commit_exchanges_copy` only writes each `out` blob into `in`'s place

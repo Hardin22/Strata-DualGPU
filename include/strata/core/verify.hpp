@@ -148,6 +148,45 @@ public:
     bool window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                          std::string& err);
 
+    // ---- PIPELINED WINDOWS (--pipeline-windows): the same window, driven without blocking the host, so one host
+    // thread can keep a window in flight on each stage.  `pl_launch` stages and launches (it never captures: call
+    // `capture_all` first), `service` serves the layers whose doorbells have rung and returns at once, `done` polls
+    // the graph's completion, `pl_finish` reads the picks.  No chaining to `next_`: the caller drives every stage.
+    /// The compute stream to use instead of a private one (two verifiers of one stage share it).  Before `init`.
+    void set_stream(cudaStream_t s) { ext_stream_ = s; }
+    /// integ3: the late PLE rows (trims' STRATA_PLE_LATE) need the host's collect between the window's layer 0 and 1
+    /// and allow one batch in flight per table, so the pipelined verifiers (two per stage) read them before the
+    /// launch instead.  Before `init`.
+    void set_no_ple_late(bool v) { no_ple_late_ = v; }
+    cudaStream_t stream() const { return cs_; }
+    int device() const { return device_; }
+    /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
+    bool capture_all(std::string& err);
+    bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    /// Stage a window ahead of its launch (the host part of `launch`: positions, the PLE rows, which read
+    /// `ple_prev` = the two tokens before the window as they WILL be).  A later `launch` of the same window (T, pos0,
+    /// tokens, and `ss.ple_prev` equal to `ple_prev` then) skips the staging; anything else stages again.
+    bool prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
+    /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: error (`err`).
+    int service(PoolMultiFn pool, void* user, std::string& err);
+    bool in_flight() const { return fl_active_; }
+    bool all_served() const { return fl_active_ && fl_k_ >= fl_total_; }
+    /// The window's graph (and its profile copy) completed; false while it runs.  An error sets `err`.
+    bool done(std::string& err);
+    /// After `done`: the profile, the last stage's host sampling and picks (`out` may be null for an earlier stage).
+    bool pl_finish(int32_t* out, std::string& err);
+    /// The commit without a host sync and without `next_`; `ss.ple_prev` advances now (host side).
+    bool pl_commit_async(int n_keep, std::string& err);
+    /// An event recorded on this verifier's stream after its last launch / commit (for cross-stream ordering).
+    cudaEvent_t done_event() const { return ev_done_; }
+    cudaEvent_t commit_event() const { return ev_commit_; }
+    int last_t() const { return last_t_; }
+    int64_t last_pos0() const { return last_pos0_; }
+    /// Fold another verifier's counters and GPU profile into this one's (the two verifiers of one stage report once).
+    void absorb_stats(Verifier& o);
+    /// The watchdog's line for a pipelined verifier: in flight, layers served, the GPU's ring and flags, its events.
+    void diag_pipelined(std::FILE* f, const char* name) const;
+
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
@@ -198,6 +237,18 @@ private:
     uint32_t* xin_ = nullptr;             // set_stage_flags (mapped portable: host and device alias)
     uint32_t* xout_ = nullptr;
     unsigned int* xcount_ = nullptr;      // handoff_publish's block counter (device)
+    bool stage_window(int T, const int32_t* tokens, int64_t pos0, std::string& err, const int32_t* ple_prev = nullptr);
+    bool prestaged_ = false;
+    bool no_ple_late_ = false;
+    int32_t prestage_prev_[2] = {-1, -1};
+    void accumulate_profile(const unsigned long long* stamps);
+    cudaStream_t ext_stream_ = nullptr;
+    cudaEvent_t ev_done_ = nullptr, ev_commit_ = nullptr;
+    unsigned long long* prof_pin_ = nullptr;   // pinned host copy of the stamps (pipelined windows)
+    bool fl_active_ = false, fl_prof_ = false, commit_live_ = false;
+    int fl_T_ = 0;
+    int64_t fl_k_ = 0, fl_total_ = 0;
+    double fl_since_ms_ = 0, fl_flush_ms_ = 0;
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;
