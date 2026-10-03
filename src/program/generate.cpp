@@ -80,6 +80,7 @@
 #include <iostream>
 #include <future>
 #include <thread>
+#include <functional>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -137,6 +138,78 @@ struct SwapHome {
     strata::core::ExpertCache* cache;
     cudaStream_t stream;
     int dev;
+};
+
+/// One background job at a time (the asynchronous adaptive tier's copies and memcpys).  `post` hands it over, `idle`
+/// says whether it has finished; the owner never posts while a job runs.
+class JobThread {
+public:
+    JobThread() : th_([this] { loop(); }) {}
+    ~JobThread() {
+        { std::lock_guard<std::mutex> lk(mu_); quit_ = true; }
+        cv_.notify_one();
+        th_.join();
+    }
+    void post(std::function<void()> f) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            job_ = std::move(f);
+            has_ = true;
+            done_.store(false, std::memory_order_release);
+        }
+        cv_.notify_one();
+    }
+    bool idle() const { return done_.load(std::memory_order_acquire); }
+    void wait() const { while (!idle()) std::this_thread::yield(); }
+private:
+    // The second logical processor of the last physical core that has two (an SMT sibling no worker or host is pinned
+    // to: the pool takes the first of every core but the first, the host the first core), or -1.
+    static int smt_spare_cpu() {
+#if defined(_WIN32)
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+        if (len == 0) return -1;
+        std::vector<char> buf(len);
+        if (!GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len))
+            return -1;
+        int best = -1, core = 0;
+        for (const char* p = buf.data(); p < buf.data() + len; p += ((const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p)->Size, ++core) {
+            const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
+            const GROUP_AFFINITY& g = e->Processor.GroupMask[0];
+            int seen = 0;
+            for (int bit = 0; bit < 64; ++bit)
+                if (g.Mask & (1ull << bit)) { if (++seen == 2 && core > 0) best = g.Group * 64 + bit; }
+        }
+        return best;
+#else
+        return -1;
+#endif
+    }
+    void loop() {
+        // keep the job's memcpys off the host's core (logical 0, pinned at setup) and its SMT sibling: by default the
+        // spare SMT sibling of the last two-thread core; STRATA_ADAPT_JOB_CPU=<logical cpu> or -1 (not pinned)
+        const char* c = std::getenv("STRATA_ADAPT_JOB_CPU");
+        const int cpu = c != nullptr ? std::atoi(c) : smt_spare_cpu();
+        if (cpu >= 0) (void) strata::kernels::cpu::pin_current_thread(cpu);
+        for (;;) {
+            std::function<void()> f;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return has_ || quit_; });
+                if (!has_) return;
+                f = std::move(job_);
+                has_ = false;
+            }
+            f();
+            done_.store(true, std::memory_order_release);
+        }
+    }
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::function<void()> job_;
+    bool has_ = false, quit_ = false;
+    std::atomic<bool> done_{true};
+    std::thread th_;
 };
 template <class Swap, class Locate>
 bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
@@ -429,6 +502,11 @@ struct Options {
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
+    /// The adaptive tier without stalling the decode loop (misspath): the swaps are chosen, copied back, copied in
+    /// and committed by a helper thread across later windows, each step applied between windows once its copies have
+    /// landed.  0 = the blocking tier (its thread is joined after every adapting window's draft).  Default on:
+    /// +18% code / +12% prose decode on the 5080 + 4060 Ti split, exact 6/6 and stress ALL OK (misspath-async-full).
+    int adapt_async = 1;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -1323,6 +1401,7 @@ int main(int argc, char** argv) {
             o.stop_eos = true;
         }
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
+        else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async"));
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
@@ -4089,8 +4168,11 @@ int main(int argc, char** argv) {
                 err = whole_err + "; " + err;
         }
         if (resident_ok) {
+            // --adapt-async: a second set of pinned buffers bounces the copies in whose source is not page-locked
             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
+                !src.reserve_exchanges(o.adapt_async ? 2 * std::min<int64_t>(o.adapt_swaps, std::getenv("STRATA_ADAPT_CAP")
+                                                                  ? std::atoll(std::getenv("STRATA_ADAPT_CAP")) : 96)
+                                                     : std::min<int64_t>(o.adapt_swaps, 96), err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
                 return 1;
             }
@@ -4560,13 +4642,31 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
+        // misspath: the PCIe share reads only page-locked experts.  With just a hot prefix of the resident RAM copy
+        // registered (the 3 GiB cap) it reached ~0.04 experts per layer-window while every layer paid the path's empty
+        // launches (flag-B wait, staging copy, PCIe groups): --pcie-frac 0 decoded 110.8 / 83.4 tok/s against
+        // 106.7 / 83.9 (code -1 to -2 ms per window).  Unless --pcie-frac is given, no share when under half of the
+        // copy is page-locked.  STRATA_PCIE_KEEP=1 keeps the probed shares.
+        if (!pcie_given && src.complement_ready() && src.pinned_bytes() * 2 < src.resident_bytes() &&
+            std::getenv("STRATA_PCIE_KEEP") == nullptr) {
+            std::fprintf(stderr, "strata serve: %.2f of %.2f GiB of the RAM copy page-locked: no PCIe share (the windows "
+                                 "skip that path; --pcie-frac sets one)\n", (double) src.pinned_bytes() / 1073741824.0,
+                         (double) src.resident_bytes() / 1073741824.0);
+            o.pcie_frac = 0.0;
+            for (auto& st : stages) st->pcie_frac = 0.0;
+            for (int st = 0; st < n_stages; ++st) split_drive.pcie_num[st] = 0;
+            drive.d.pcie_num = 0;
+        }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
             if (st > 0) {
                 stage_ver(st).set_split(o.spec_split);
                 stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
             }
+            // misspath: a stage with no PCIe share records no PCIe path (and a request cannot give it one, below)
+            if (split_drive.pcie_num[st] == 0) stage_ver(st).set_no_pcie(true);
         }
+        if (n_stages == 1 && std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5))) == 0) ver.set_no_pcie(true);
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
@@ -4931,6 +5031,196 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: the expert profile was not saved: %s\n", e.c_str());
             profile_saved_at = Clock::now();
         };
+        // ---- misspath: the asynchronous adaptive tier (--adapt-async 1).  The blocking tier above runs a whole round
+        // (choose, copy back with a stream sync, copy in from pageable RAM through the driver's staging) on a thread
+        // the loop joins after the draft: measured ~24 ms every 4th window with ~88 swaps (most of the "unexplained"
+        // ~5 ms per window).  Here a round moves through four steps, each started by `adapt_tick` between windows once
+        // the previous step's copies (events) and host work (the job thread) are done, so no window waits for it:
+        //   1. job: choose (the same rule, over snapshots of the usage and the residency) and copy the evicted slots
+        //      back into exchange buffers (D2H);
+        //   2. stage the exchanges and mark the evicted experts non-resident (the CPU reads them from the exchange
+        //      buffers from the next window on); job: copy the new experts in (from the RAM copy when it is
+        //      page-locked, else through a pinned bounce buffer);
+        //   3. mark the new experts resident; job: move the evicted blobs into their places in the RAM copy;
+        //   4. flip the copy's offsets.
+        // Safety: a slot is overwritten only after its old expert stopped being planned for the GPU (step 2 is
+        // between windows), and a RAM place only once its expert is resident (step 3), so no window computes from
+        // either while it changes; a request starts with the round drained (adapt_tick(true)).
+        struct ASwap { int32_t layer, in, out, slot; int home; int64_t q; };
+        struct AHome { strata::core::ExpertCache* cache; cudaStream_t stream; cudaEvent_t ev; int dev; bool used; };
+        enum class AState { Idle, CopyBack, SwapIn, Commit };
+        AState astate = AState::Idle;
+        std::vector<ASwap> aswaps;
+        std::vector<float> a_usage;
+        std::vector<int32_t> a_res;
+        int64_t a_win = 0, a_last_round = -1000000, a_rounds = 0, a_swaps_total = 0;
+        bool a_dirty = false;
+        std::atomic<bool> a_err{false};
+        std::vector<AHome> ahomes;     // [0] = CUDA0's cache, [1..] = the later stages'
+        std::unique_ptr<JobThread> ajob;
+        // policy knobs of the asynchronous tier (defaults = the blocking tier's rule): STRATA_ADAPT_MIN (a candidate's
+        // decayed count), STRATA_ADAPT_MARGIN (over its victim's), STRATA_ADAPT_DECAY (per round), STRATA_ADAPT_W1 (gain
+        // weight of the later stages' layers: their misses stall the faster card), STRATA_ADAPT_CAP (swaps per round,
+        // above the 96 exchange buffers of the blocking tier)
+        auto envf = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
+        const float a_min = (float) envf("STRATA_ADAPT_MIN", 2.0), a_margin = (float) envf("STRATA_ADAPT_MARGIN", 1.5);
+        const float a_decay = (float) envf("STRATA_ADAPT_DECAY", 0.7), a_w1 = (float) envf("STRATA_ADAPT_W1", 1.0);
+        // The exchange buffers are 2 x cap: copies back, and bounce buffers for copies in from pageable RAM.  With the
+        // whole RAM copy page-locked (STRATA_RESIDENT_PIN_CHUNK_MIB) no copy in needs a bounce, so all of them take
+        // copies back: twice the swaps per round from the same pinned memory (tools/adapt_sim.py: cap 192 -> -12% of
+        // the later stage's misses against 96).
+        const bool a_all_pinned = src.complement_ready() && src.resident_bytes() > 0 && src.pinned_bytes() >= src.resident_bytes();
+        const int64_t a_cap0 = std::min<int64_t>(o.adapt_swaps, (int64_t) envf("STRATA_ADAPT_CAP", 96));
+        const int64_t a_cap = a_all_pinned ? 2 * a_cap0 : a_cap0;
+        const int64_t a_bounce = a_all_pinned ? -1 : a_cap;   // first bounce buffer, -1 = none
+        static const bool a_e6 = [] { const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); return v && std::atoi(v) != 0; }();
+        if (o.adapt_async && !drive.d.usage.empty() && src.complement_ready() && src.exchange_capacity() >= 2 * a_cap0) {
+            ahomes.push_back({&xcache, adapt_stream, adapt_ev, -1, false});
+            for (auto& st : stages) ahomes.push_back({&st->cache, st->adapt_stream, st->adapt_ev, st->dev, false});
+            ajob = std::make_unique<JobThread>();
+            std::fprintf(stderr, "strata serve: adaptive tier asynchronous (up to %lld swaps per round, every %d windows%s)\n",
+                         (long long) a_cap, o.adapt_every, a_all_pinned ? "; the RAM copy is page-locked: no bounce" : "");
+        }
+        auto a_flush_events = [&]() {
+            for (AHome& h : ahomes)
+                if (h.used) {
+                    const strata::core::OnDevice on(h.dev);
+                    if (cudaEventRecord(h.ev, h.stream) != cudaSuccess) a_err = true;
+                    (void) cudaStreamQuery(h.stream);   // WDDM: submit now
+                }
+        };
+        auto a_choose = [&]() {   // step 1, on the job thread
+            struct C { float gain; int32_t layer, in, out; };
+            std::vector<C> all;
+            std::vector<std::pair<float, int32_t>> cand, vict;
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                cand.clear();
+                vict.clear();
+                const float* u = a_usage.data() + l * g.n_expert;
+                const int32_t* r = a_res.data() + l * g.n_expert;
+                for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                    if (r[e] < 0) { if (u[e] >= a_min) cand.emplace_back(u[e], e); }
+                    else vict.emplace_back(u[e], e);
+                }
+                if (cand.empty() || vict.empty()) continue;
+                std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                const size_t nc = std::min(cand.size(), vict.size());
+                std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
+                                  [](auto& a, auto& b) { return a.first < b.first; });
+                const float wl = multi_gpu && stage_of(l) > 0 ? a_w1 : 1.0f;
+                for (size_t i = 0; i < nc; ++i) {
+                    if (cand[i].first < vict[i].first + a_margin) break;
+                    all.push_back({wl * (cand[i].first - vict[i].first), (int32_t) l, cand[i].second, vict[i].second});
+                }
+            }
+            std::sort(all.begin(), all.end(), [](const C& a, const C& b) { return a.gain > b.gain; });
+            aswaps.clear();
+            for (const C& c : all) {
+                if ((int64_t) aswaps.size() >= a_cap) break;
+                // an exchange only: `in` read from the RAM copy (never the file), `out` given its place there
+                if (!src.has_resident(c.layer, c.in) || src.has_resident(c.layer, c.out)) continue;
+                const int32_t slot = a_res[(size_t) c.layer * g.n_expert + c.out];
+                if (slot < 0) continue;
+                aswaps.push_back({c.layer, c.in, c.out, slot, multi_gpu ? stage_of(c.layer) : 0, (int64_t) aswaps.size()});
+            }
+            for (AHome& h : ahomes) h.used = false;
+            for (const ASwap& w : aswaps) {
+                AHome& h = ahomes[(size_t) w.home];
+                const strata::core::OnDevice on(h.dev);
+                if (cudaMemcpyAsync(src.exchange_buffer(w.q), h.cache->device_slot(w.slot),
+                                    (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
+                                    cudaMemcpyDeviceToHost, h.stream) != cudaSuccess) a_err = true;
+                h.used = true;
+            }
+            a_flush_events();
+        };
+        auto a_copy_in = [&]() {   // step 2, on the job thread
+            for (AHome& h : ahomes) h.used = false;
+            for (const ASwap& w : aswaps) {
+                AHome& h = ahomes[(size_t) w.home];
+                const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer);
+                const uint8_t* b = src.resident_blob(w.layer, w.in);
+                if (b == nullptr) { a_err = true; continue; }
+                if (!src.pinned(w.layer, w.in) && a_bounce >= 0) {   // a pinned bounce buffer: an async copy, not a staged one
+                    uint8_t* bb = src.exchange_buffer(a_bounce + w.q);
+                    std::memcpy(bb, b, nb);
+                    b = bb;
+                }   // (all pinned and still not: the driver stages it - correct, only slower, on this thread)
+                const strata::core::OnDevice on(h.dev);
+                if (cudaMemcpyAsync(h.cache->device_slot(w.slot), b, nb, cudaMemcpyHostToDevice, h.stream) != cudaSuccess)
+                    a_err = true;
+                h.used = true;
+            }
+            a_flush_events();
+        };
+        auto a_ready = [&](bool wait) -> bool {
+            if (wait) ajob->wait();
+            else if (!ajob->idle()) return false;
+            for (AHome& h : ahomes)
+                if (h.used) {
+                    const strata::core::OnDevice on(h.dev);
+                    if (wait) { if (cudaEventSynchronize(h.ev) != cudaSuccess) a_err = true; }
+                    else if (const cudaError_t q = cudaEventQuery(h.ev); q == cudaErrorNotReady) return false;
+                    else if (q != cudaSuccess) a_err = true;
+                }
+            return true;
+        };
+        // between windows (drain = finish the round in flight; a request starts drained).  False on a failed copy.
+        auto adapt_tick = [&](bool drain) -> bool {
+            if (!ajob) return true;
+            if (!drain) ++a_win;   // one tick per window
+            for (;;) {
+                if (a_err.load()) return false;
+                switch (astate) {
+                case AState::Idle:
+                    if (drain) {
+                        if (a_dirty) { res_upload(); a_dirty = false; }
+                        return true;
+                    }
+                    if (a_win - a_last_round < (int64_t) o.adapt_every) return true;
+                    a_last_round = a_win;
+                    ++a_rounds;
+                    a_usage = drive.d.usage;
+                    a_res = host_res;
+                    for (float& v : drive.d.usage) v *= a_decay;
+                    ajob->post(a_choose);
+                    astate = AState::CopyBack;
+                    return true;
+                case AState::CopyBack:
+                    if (!a_ready(drain)) return true;
+                    if (aswaps.empty()) { astate = AState::Idle; continue; }
+                    for (const ASwap& w : aswaps) {
+                        if (!src.stage_exchange(w.layer, w.in, w.out, w.q)) {
+                            std::fprintf(stderr, "strata serve: async adaptive tier: stage_exchange refused layer %d in %d out %d\n",
+                                         (int) w.layer, (int) w.in, (int) w.out);
+                            return false;
+                        }
+                        host_res[(size_t) w.layer * g.n_expert + w.out] = strata::core::kNotResident;
+                    }
+                    a_dirty = true;
+                    if (a_e6) { res_upload(); a_dirty = false; }
+                    ajob->post(a_copy_in);
+                    astate = AState::SwapIn;
+                    if (!drain) return true;
+                    continue;
+                case AState::SwapIn:
+                    if (!a_ready(drain)) return true;
+                    for (const ASwap& w : aswaps) host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
+                    a_dirty = true;
+                    if (a_e6) { res_upload(); a_dirty = false; }
+                    ajob->post([&] { src.commit_copies(); });
+                    astate = AState::Commit;
+                    if (!drain) return true;
+                    continue;
+                case AState::Commit:
+                    if (!a_ready(drain)) return true;
+                    a_swaps_total += src.commit_flip();
+                    aswaps.clear();
+                    astate = AState::Idle;
+                    continue;   // a round due now starts at this same boundary (--adapt-every 3: one every 3 windows)
+                }
+            }
+        };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
         // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
         std::atomic<bool> stop_req{false};
@@ -5081,6 +5371,23 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        // STRATA_HOST_CPU=<logical cpu> (misspath experiment): the host loop - doorbell spins, plans, its share of the
+        // pool - on another logical processor than the first core's first (where Windows lands many interrupts and
+        // DPCs); 1 = that core's SMT sibling, which the pool also leaves free
+        if (const char* hc = std::getenv("STRATA_HOST_CPU"); hc != nullptr && std::atoi(hc) >= 0)
+            (void) strata::kernels::cpu::pin_current_thread(std::atoi(hc));
+#if defined(_WIN32)
+        // STRATA_NO_ECOQOS=1 (misspath experiment): opt the process out of Windows power throttling (EcoQoS), which
+        // may run a window-less process's threads at efficiency clocks
+        if (const char* q = std::getenv("STRATA_NO_ECOQOS"); q != nullptr && std::atoi(q) != 0) {
+            PROCESS_POWER_THROTTLING_STATE pt{};
+            pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+            pt.StateMask = 0;
+            const BOOL ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
+            std::fprintf(stderr, "strata serve: power throttling opt-out %s\n", ok ? "set" : "refused");
+        }
+#endif
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -5618,6 +5925,10 @@ int main(int argc, char** argv) {
                 return true;
             };
             apply_pending(true);
+            if (!adapt_tick(true)) {
+                std::printf("ERR an adaptive refill failed\n");
+                return 1;
+            }
             // per-request sampling for the verify window's head (greedy when temperature is absent)
             strata::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
@@ -5635,10 +5946,13 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
+            if (ver.no_pcie()) drive.d.pcie_num = 0;   // its window has no PCIe path
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
-            for (int st = 0; st < split_drive.n; ++st)
+            for (int st = 0; st < split_drive.n; ++st) {
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
+                if (stage_ver(st).no_pcie()) split_drive.pcie_num[st] = 0;
+            }
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
@@ -5784,6 +6098,10 @@ int main(int argc, char** argv) {
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
                 apply_pending(!adapt_nowait());
+                if (!adapt_tick(false)) {
+                    std::printf("ERR an adaptive refill failed\n");
+                    return 1;
+                }
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
@@ -5807,7 +6125,7 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
-                if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
+                if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();

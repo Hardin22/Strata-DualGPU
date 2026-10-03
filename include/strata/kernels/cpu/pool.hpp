@@ -154,6 +154,11 @@ public:
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    /// The same outputs as `run_split_multi_native`, bitwise (the same row kernels and quantizers), in ONE batch:
+    /// each expert's gate/up row parts, then its down row parts, a down part starting as soon as its expert's
+    /// intermediate is quantized (by the thread that finished the expert's last gate/up part).  No barrier and no
+    /// host-only quantization between the halves (misspath).
+    void run_fused_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -193,6 +198,9 @@ private:
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
+    void native_gu_part(int e, int r0, int r1);
+    void native_quant_part(int e);
+    void native_down_part(int e, int r0, int r1);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
@@ -267,6 +275,14 @@ private:
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
+    // run_fused_native (mode 7): parts per expert of each half, experts, and per expert the gate/up parts done and
+    // whether its intermediate is quantized (one cache line each)
+    int fa_ = 1, fb_ = 1, fn_ = 0;
+    struct alignas(64) FusedState {
+        std::atomic<int32_t> gu_done{0};
+        std::atomic<int32_t> ready{0};
+    };
+    std::unique_ptr<FusedState[]> fstate_;
 };
 
 }  // namespace strata::kernels::cpu

@@ -1620,7 +1620,9 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     }
     const size_t total = (size_t) n * (size_t) blob;
     void* p = nullptr;
-    if (cudaHostAlloc(&p, total, cudaHostAllocDefault) == cudaSuccess && p != nullptr) {
+    // PORTABLE: the copies back come from every stage's card, and a buffer pinned for one context only is pageable
+    // (a staged, synchronous copy) for the others
+    if (cudaHostAlloc(&p, total, cudaHostAllocPortable) == cudaSuccess && p != nullptr) {
         xstage_pinned_ = true;
     } else {
         (void) cudaGetLastError();
@@ -1667,6 +1669,39 @@ int64_t FileExpertSource::commit_exchanges() {
     staged_.clear();
     exchanges_ += n;
     return n;
+}
+
+void FileExpertSource::commit_copies() {
+    for (const Exchange& x : staged_) {
+        const uint8_t* src = override_.empty() ? nullptr : override_[x.out];
+        const uint64_t at = complement_offsets_[x.in];
+        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
+            complement_host_ != nullptr)
+            std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+    }
+}
+
+int64_t FileExpertSource::commit_flip() {
+    int64_t n = 0;
+    for (const Exchange& x : staged_) {
+        const uint8_t* src = override_[x.out];
+        const uint64_t at = complement_offsets_[x.in];
+        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
+            complement_host_ != nullptr && detail::exchange_cache_complement(complement_offsets_, x.in, x.out))
+            ++n;
+        override_[x.out] = nullptr;
+    }
+    staged_.clear();
+    exchanges_ += n;
+    return n;
+}
+
+const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) const {
+    if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ ||
+        expert >= n_expert_) return nullptr;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement) return nullptr;
+    return complement_host_ + (size_t) complement_offsets_[index];
 }
 
 const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
@@ -1850,6 +1885,23 @@ namespace {
 // refused at run time rather than written past them.
 constexpr int64_t kMaxWindowEntries = 128;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+
+// STRATA_ROUTE_TRACE=<file>: a binary record per verify-window layer (diagnostics for the miss path; off by default).
+//   u32 magic 'RTR2', i32 layer, i32 n_tok, i32 k, i64 t_ns (entry), f32 us_plan, us_actq, us_jobs, us_run, i32 njobs,
+//   i32 has_x, i32 ids[n_tok*k], i8 kind[n_tok*k] (-1 CPU, 0 VRAM, 1 PCIe, 2 remote), then f32 x[n_tok*2560] if has_x, then u8 residency bitmap[64].
+// STRATA_ROUTE_TRACE_X=<n>: dump the activations for the first n layer records (default 0).
+struct RouteTrace {
+    std::FILE* f = nullptr;
+    long long x_left = 0;
+    RouteTrace() {
+        if (const char* p = std::getenv("STRATA_ROUTE_TRACE")) {
+            f = std::fopen(p, "wb");
+            if (const char* x = std::getenv("STRATA_ROUTE_TRACE_X")) x_left = std::atoll(x);
+        }
+    }
+    ~RouteTrace() { if (f) std::fclose(f); }
+};
+RouteTrace& route_trace() { static RouteTrace t; return t; }
 }  // namespace
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
@@ -1890,7 +1942,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
     int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
-    if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
+    const bool published = d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap;
+    if (published) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
         for (int64_t i = 0; i < n; ++i) {
@@ -2034,8 +2087,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
                 else if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
+                // The graph's batched row copy (verify.cpp, copy_rows_from_mapped) zeroes the GPU's own rows on the
+                // device and never reads them here, so zeroing them was ~6 us of host time per layer before the
+                // pool could start.  Kept for the paths that copy every row: STRATA_DEC_BATCH=0 and the E-6 device
+                // plan (copy_or_zero_from_mapped), and for remote rows (their tier writes them below).
+                static const bool zero_gpu_rows = [] {
+                    const char* b = std::getenv("STRATA_DEC_BATCH");
+                    const char* p = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
+                    const char* z = std::getenv("STRATA_ZERO_GPU_ROWS");
+                    return (b != nullptr && std::atoi(b) == 0) || (p != nullptr && std::atoi(p) != 0) ||
+                           (z != nullptr && std::atoi(z) != 0);
+                }();
                 // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it
-                if (!(kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()))
+                const bool peer_direct = kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct();
+                if (!peer_direct && (zero_gpu_rows || !published || kind[i] == 2))
                     std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
             }
@@ -2065,7 +2130,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
-    if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+    // STRATA_POOL_FUSED=1: one batch per layer (no barrier between the gate/up and the down rows), same bytes
+    static const bool fused = [] { const char* v = std::getenv("STRATA_POOL_FUSED"); return v != nullptr && std::atoi(v) != 0; }();
+    if (native && fused) d.pool->run_fused_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+    else if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
@@ -2091,6 +2159,30 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
+    if (RouteTrace& rt = route_trace(); rt.f != nullptr) {
+        const uint32_t magic = 0x32525452u;
+        const int32_t hdr[3] = {(int32_t) d.layers, (int32_t) n_tok, (int32_t) k};
+        const int64_t tns = std::chrono::duration_cast<std::chrono::nanoseconds>(c0.time_since_epoch()).count();
+        const float us[4] = {(float) (1e3 * ms(c0, c1)), (float) (1e3 * ms(c1, c2)), (float) (1e3 * ms(c2, c3)),
+                             (float) (1e3 * ms(c3, c4))};
+        const int32_t has_x = rt.x_left > 0 ? 1 : 0;
+        const int32_t tail[2] = {(int32_t) njobs, has_x};
+        int8_t kk[kMaxWindowEntries];
+        for (int64_t i = 0; i < n_tok * k; ++i) kk[i] = (int8_t) kind[i];
+        std::fwrite(&magic, 4, 1, rt.f);
+        std::fwrite(hdr, 4, 3, rt.f);
+        std::fwrite(&tns, 8, 1, rt.f);
+        std::fwrite(us, 4, 4, rt.f);
+        std::fwrite(tail, 4, 2, rt.f);
+        std::fwrite(ids, 4, (size_t) (n_tok * k), rt.f);
+        std::fwrite(kk, 1, (size_t) (n_tok * k), rt.f);
+        if (has_x) { std::fwrite(x_f, 4, (size_t) (n_tok * H), rt.f); --rt.x_left; }
+        uint8_t bm[64] = {};   // this layer's residency (host_res >= 0), one bit per expert
+        if (d.host_res != nullptr && d.n_expert <= 512)
+            for (int64_t e = 0; e < d.n_expert; ++e)
+                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) bm[e >> 3] |= (uint8_t) (1u << (e & 7));
+        std::fwrite(bm, 1, 64, rt.f);
+    }
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;

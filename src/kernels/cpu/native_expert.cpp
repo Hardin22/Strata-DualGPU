@@ -69,6 +69,10 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    // Q8_K (every i-quant gate/up): ggml-cpu's x86 quantizer is the scalar reference, ~3 us per token on the host
+    // before the pool can start; the AVX-2 copy writes the same bytes (STRATA_NO_Q8K_AVX2=1: ggml's).
+    static const bool q8k_avx2 = std::getenv("STRATA_NO_Q8K_AVX2") == nullptr;
+    if (q8k_avx2 && f.gu_act == (int) GGML_TYPE_Q8_K) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
 
