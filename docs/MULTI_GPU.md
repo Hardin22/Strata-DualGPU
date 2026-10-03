@@ -136,7 +136,9 @@ The Coder on an RTX 5080 + RTX 3090 (Ryzen 9 9950X3D), 32K context; details in
 - **Correctness:** one GPU is byte-identical to 0.1.20, and the hand-off itself is bit-exact.
 
 **Which cards and in what order:**
-- Put the fastest card first; auto gives it as many layers as its cache allows.
+- Put the fastest card last (in this fork; upstream puts it first): the last card runs the head, the draft layer
+  and the pipelined windows' draft chain ([DUAL_GPU.md](DUAL_GPU.md)). With `"layer_split": "auto"` the server
+  orders the cards that way itself, and auto gives each card as many layers as its cache allows.
 - Leave out a much slower card when two already hold the model. An RTX 2080 Ti as a third card made the 5080 +
   3090 pair slower (68 / 90 tok/s decode): every extra card costs its own round per window.
 - More cards pay off when the model's routed experts do not fit the faster ones.

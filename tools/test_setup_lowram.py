@@ -38,21 +38,18 @@ def run(fn, *args, stdin=None):
     return code, out.getvalue(), asked
 
 
-class OneGpuWhy(unittest.TestCase):
+class LowRamWhy(unittest.TestCase):
     def test_auto_shows_the_ram_math(self):
-        lines = setup.low_ram_one_gpu_why("IQ3_XXS", 46, "auto")       # the #250 report: 46 GB, IQ3_XXS
+        lines = setup.low_ram_why("IQ3_XXS", 46, "auto")               # the #250 report: 46 GB, IQ3_XXS
         text = "\n".join(lines)
         arena = setup.MODELS["IQ3_XXS"]["arena_gb"]
         need = arena + setup.LOW_RAM_HEADROOM_GB
         self.assertIn(f"{arena:.0f} + {setup.LOW_RAM_HEADROOM_GB} = {need:.0f} GB", text)
         self.assertIn("this PC has 46 GB", text)
-        self.assertIn("layer split", text)                            # why one GPU is recommended
-        self.assertIn("--gpus 0,1", text)                             # #364 #384: and the way to use them all
-        self.assertIn("OS file cache", text)
         self.assertNotIn("--low-ram off", text)                       # (that pages the experts: not the way)
 
     def test_an_explicit_choice_says_so(self):
-        text = "\n".join(setup.low_ram_one_gpu_why("Q2_0", 64, "resident"))
+        text = "\n".join(setup.low_ram_why("Q2_0", 64, "resident"))
         self.assertIn("you chose the low-RAM mode (--low-ram resident)", text)
 
 

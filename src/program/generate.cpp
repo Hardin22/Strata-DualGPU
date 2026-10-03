@@ -528,8 +528,9 @@ struct Options {
     int64_t short_read = 64;
     /// --pipeline-windows N (layer split on two GPUs, --serve): 1 = the prompt's verify windows run pipelined (stage 0
     /// reads window K+1 while stage 1 reads K); 2 = also decode, stage 0 running window K+1 speculatively while stage 1
-    /// verifies K (rolled back when K is not fully accepted).  0 = off.
-    int pipeline_windows = 0;
+    /// verifies K (rolled back when K is not fully accepted).  0 = off.  -1 (the default): 2 when the layer split runs
+    /// on exactly two GPUs, else 0.
+    int pipeline_windows = -1;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -697,9 +698,15 @@ void usage() {
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
-                 "                       except the one the host loop spins on (with --pool-affinity auto or\n"
-                 "                       p-cores on a hybrid CPU: P-cores minus 1).  A sweep is how the pool's\n"
-                 "                       deviation from `cpu_s2` is attributed.\n"
+                 "                       except the one the host loop spins on; on a hybrid CPU the P-cores\n"
+                 "                       but that one plus half of the E-cores (with --pool-affinity auto or\n"
+                 "                       p-cores: P-cores minus 1).  A sweep is how the pool's deviation from\n"
+                 "                       `cpu_s2` is attributed.\n"
+                 "  --pipeline-windows N --serve, a layer split on two GPUs: 2 = stage 0 runs window K+1 while\n"
+                 "                       stage 1 verifies K (the default there), 1 = only the prompt's windows,\n"
+                 "                       0 = off (the stages take turns).\n"
+                 "  --list-gpus          print the visible CUDA devices (SMs, clock, VRAM, compute capability)\n"
+                 "                       and exit; the server orders a split's cards with it.\n"
                  "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
                  "                       always), auto (hybrid CPUs: P-cores first, then their SMT siblings,\n"
                  "                       then E-cores) or p-cores (P-cores and their siblings only).\n"
@@ -1269,6 +1276,22 @@ int main(int argc, char** argv) {
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 #endif
     }
+    if (argc == 2 && std::string(argv[1]) == "--list-gpus") {
+        // one line per visible device, in the order CUDA_VISIBLE_DEVICES gives them: what serve/server.py needs to
+        // put a layer split's faster card last (it runs the head, the draft layer and the draft chain)
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess) n = 0;
+        for (int d = 0; d < n; ++d) {
+            cudaDeviceProp p{};
+            if (cudaGetDeviceProperties(&p, d) != cudaSuccess) continue;
+            int khz = 0;
+            if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, d) != cudaSuccess || khz <= 0) khz = 0;
+            std::printf("gpu %d sms=%d khz=%d mib=%lld cc=%d.%d name=%s\n", d, p.multiProcessorCount, khz,
+                        (long long) (p.totalGlobalMem >> 20), p.major, p.minor, p.name);
+        }
+        cudaGetLastError();
+        return n > 0 ? 0 : 1;
+    }
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
@@ -1544,6 +1567,21 @@ int main(int argc, char** argv) {
     }
     strata::core::set_coupled_draft(o.coupled_draft);
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
+    // --pipeline-windows by default: on (2) for a layer split on exactly two GPUs - one split point on the next visible
+    // card, or "auto" with two cards visible - where the two stages can overlap; off for one card or three
+    if (o.pipeline_windows < 0) {
+        int n_dev = 0;
+        if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
+        cudaGetLastError();
+        const bool one_point = !o.layer_split.empty() && o.layer_split != "auto" &&
+                               o.layer_split.find(',') == std::string::npos;
+        const bool two = o.serve && o.split_device.empty() &&
+                         ((o.layer_split == "auto" && n_dev == 2) || (one_point && n_dev >= 2));
+        o.pipeline_windows = two ? 2 : 0;
+        if (two)
+            std::fprintf(stderr, "strata serve: pipelined windows on (two GPUs: stage 0 runs the next window while "
+                                 "stage 1 verifies; --pipeline-windows 0 turns it off)\n");
+    }
     // --pipeline-windows: the second verifier per stage (and, with 2, stage 0's GDN snapshot) are allocated after the
     // expert caches are sized: keep their room out of the caches (STRATA_PIPELINE_RESERVE=0 keeps the reserves as given)
     if (o.serve && o.pipeline_windows > 0 && !o.layer_split.empty() &&
@@ -2686,6 +2724,7 @@ int main(int argc, char** argv) {
                          (double) cap[(size_t) i] / 1073741824.0);
         }
         const double miss_ms = std::getenv("STRATA_SPLIT_MISS_MS") ? std::atof(std::getenv("STRATA_SPLIT_MISS_MS")) : 190.0;
+        const bool pipelined = o.pipeline_windows >= 2 && ns == 2;   // the stages run at the same time (see predict)
         std::vector<double> mass(profile.size());
         double total_mass = 0;
         for (size_t r = 0; r < profile.size(); ++r) total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
@@ -2707,17 +2746,35 @@ int main(int argc, char** argv) {
             held_mass = 0;
             held = 0;
             std::vector<bool> full((size_t) ns, false);
+            std::vector<double> missed((size_t) ns, 0.0);   // the routed mass each stage's cache leaves to the CPU
             for (size_t r = 0; r < profile.size(); ++r) {
                 const int64_t l = profile[r].first;
                 int st = 0;
                 while (st + 1 < ns && l >= at[(size_t) st]) ++st;
-                if (full[(size_t) st]) continue;
-                if (used[(size_t) st] + cost(l) > capr[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
+                if (full[(size_t) st]) { missed[(size_t) st] += mass[r]; continue; }
+                if (used[(size_t) st] + cost(l) > capr[(size_t) st]) {   // as the fill
+                    full[(size_t) st] = true;
+                    missed[(size_t) st] += mass[r];
+                    continue;
+                }
                 used[(size_t) st] += cost(l);
                 held_mass += mass[r];
                 ++held;
             }
             held_mass /= std::max(total_mass, 1e-9);
+            if (pipelined) {
+                // --pipeline-windows 2: the stages overlap, so a window costs about the slower stage, and a stage's CPU
+                // misses wait on that stage.  The last one also runs the head and the draft chain the next window waits
+                // for: ~4 ms on an RTX 5080, about 12 of its layers.  (A sum of the stages put 2 of 48 layers on the
+                // first card of a 4060 Ti + 5080 pair and left most of its VRAM idle: 29 tok/s against 165 at K=20.)
+                double slowest = 0.0;
+                for (int i = 0; i < ns; ++i) {
+                    const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                    const double gpu = (double) (le - lb + (i + 1 == ns ? 12 : 0)) * layer_ms[(size_t) i];
+                    slowest = std::max(slowest, gpu + miss_ms * missed[(size_t) i] / std::max(total_mass, 1e-9));
+                }
+                return slowest;
+            }
             double ms = miss_ms * (1.0 - held_mass);
             for (int i = 0; i < ns; ++i) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
@@ -5707,9 +5764,10 @@ int main(int argc, char** argv) {
         if (const char* hc = std::getenv("STRATA_HOST_CPU"); hc != nullptr && std::atoi(hc) >= 0)
             (void) strata::kernels::cpu::pin_current_thread(std::atoi(hc));
 #if defined(_WIN32)
-        // STRATA_NO_ECOQOS=1 (misspath experiment): opt the process out of Windows power throttling (EcoQoS), which
-        // may run a window-less process's threads at efficiency clocks
-        if (const char* q = std::getenv("STRATA_NO_ECOQOS"); q != nullptr && std::atoi(q) != 0) {
+        // Opt the process out of Windows power throttling (EcoQoS): Windows may run a window-less background process's
+        // threads at efficiency clocks or park them on E-cores, and the host loop and the pool are latency bound.
+        // STRATA_NO_ECOQOS=0 leaves the OS's choice.
+        if (const char* q = std::getenv("STRATA_NO_ECOQOS"); q == nullptr || std::atoi(q) != 0) {
             PROCESS_POWER_THROTTLING_STATE pt{};
             pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
             pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;

@@ -170,10 +170,9 @@ class Golden(unittest.TestCase):
     def test_the_baseline_covers_every_kind_of_pc(self):
         written = [k for k, v in self.golden.items() if v["code"] == 0]
         self.assertGreaterEqual(len(written), 20)
-        lowram_multi = self.golden["32GB-2x24GB qwen IQ3_XXS"]["config"]   # #364: low-RAM, two cards -> one
-        self.assertIn("--resident-experts" if "--resident-experts" in lowram_multi["args"] else "--mmap-experts",
-                      lowram_multi["args"])
-        self.assertNotIsInstance(lowram_multi.get("gpu"), list)
+        lowram_multi = self.golden["32GB-2x24GB qwen IQ3_XXS"]["config"]   # low-RAM, two cards: both, resident
+        self.assertIn("--resident-experts", lowram_multi["args"])
+        self.assertEqual(lowram_multi.get("gpu"), [0, 1])
 
     def test_yes(self):
         for key, ram, found, family, model in self.cases():

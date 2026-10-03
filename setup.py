@@ -592,22 +592,6 @@ def choose_gpus(a, found) -> list:
     return [g["index"] for g in pick]
 
 
-def split_mmap(cfg: dict) -> bool:
-    """#364 #384: the low-RAM mode's resident variant (--resident-experts) has no layer split yet.  A config with it
-    that runs on several GPUs reads the experts the GPUs do not hold through the OS file cache instead
-    (--mmap-experts: the placement those reports measured 1.3-1.6x faster than one GPU), said plainly - the engine
-    used to refuse the pair.  True when the config changed."""
-    a = cfg.get("args", [])
-    if "--resident-experts" not in a:
-        return False
-    a[a.index("--resident-experts")] = "--mmap-experts"
-    warn("the low-RAM mode's resident variant (--resident-experts) has no layer split yet: on several GPUs the experts "
-         "the GPUs do not hold are read through the OS file cache (--mmap-experts) instead, and RAM can fill up to 0 "
-         "free during long prompts. One GPU keeps them in RAM (steady RAM use): START-HERE --setup, or --gpu N for a "
-         "start")
-    return True
-
-
 def unsloth_split_need_gb(model="UD-Q4_K_XL") -> float:
     """#498: the RAM UD-Q4_K_XL needs on several GPUs, where it has no RAM budget (the engine refuses
     --resident-budget-gib with a layer split): its GGUF files and UNSLOTH_RAM_LEFT_GB more (~135 GB).  Measured safe
@@ -650,15 +634,13 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
         return cfg
     pair = can[:2]
     cfg["gpus_asked"] = True
-    # #364 #384: the resident low-RAM variant stays on one card unless the user says otherwise (its RAM use is steady)
     resident = "--resident-experts" in cfg.get("args", [])
     say()
     say("  This PC has " + " and ".join(gpu_name(g) for g in pair) + ": Strata can share the model across both.")
     say("  Together they hold about twice the model's experts and read prompts about 20% faster (docs/MULTI_GPU.md).")
     if resident:
-        say("  This model runs in the low-RAM mode with its experts kept in RAM, on one GPU (recommended: steady RAM")
-        say("  use). On both, the experts the GPUs do not hold are read through the OS file cache instead: faster in")
-        say("  two reports (#364, #384), but RAM can fill up to 0 free during long prompts.")
+        say("  This model runs in the low-RAM mode: on both cards each one holds the most-used experts of its own")
+        say("  layers, and the experts neither holds stay in RAM as now.")
     if budget:
         say("  This model (UD-Q4_K_XL) runs on one GPU with a RAM budget of its experts (recommended: the tested")
         say("  setup). On both it has no budget: all its experts are loaded into RAM at start, which this PC's RAM")
@@ -671,10 +653,9 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
         say("  The installed engine has no code for " + ", ".join(g["name"] for g in missing) + ": to use them "
             "together, run START-HERE.bat --setup --gpus " + ",".join(str(g["index"]) for g in pair))
     elif ask("  Use both from now on? (you can change it later: START-HERE.bat --gpu N for one card)",
-             ["y", "n"], "n" if resident or short or budget else "y", yes) == "y":
+             ["y", "n"], "n" if short or budget else "y", yes) == "y":
         cfg["gpu"] = [g["index"] for g in pair]
         cfg["layer_split"] = cfg.get("layer_split") or "auto"
-        split_mmap(cfg)
         split_budget(cfg)
         ok("from now on this model runs on " + " + ".join(gpu_name(g) for g in pair))
     else:
@@ -2058,9 +2039,8 @@ def low_ram_fits(model, ram, vram_gb) -> bool:
     return ram - 6 + max(0.0, vram_gb - 5) >= arena
 
 
-def low_ram_one_gpu_why(model, ram, choice, sel=None) -> list[str]:
-    """#250: why the low-RAM mode recommends one GPU, with the RAM math that turned it on; #364 #384: and how to use
-    all of them (sel: the cards, for the --gpus example)."""
+def low_ram_why(model, ram, choice) -> list[str]:
+    """#250: why the low-RAM mode is on, with the RAM math that turned it on."""
     arena, need = MODELS[model]["arena_gb"], MODELS[model]["arena_gb"] + LOW_RAM_HEADROOM_GB
     if choice == "auto":
         why = [f"Why: {model}'s experts are {arena:.0f} GB and must fit in RAM with ~{LOW_RAM_HEADROOM_GB} GB beside "
@@ -2071,47 +2051,17 @@ def low_ram_one_gpu_why(model, ram, choice, sel=None) -> list[str]:
     else:
         why = [f"Why: you chose the low-RAM mode (--low-ram {choice}); without it {model} needs {arena:.0f} + "
                f"{LOW_RAM_HEADROOM_GB} = {need:.0f} GB of RAM, this PC has {ram:.0f} GB."]
-    return why + ["Its resident variant (the experts the GPU does not hold copied into RAM once: steady RAM use) runs "
-                  "on one GPU: the engine has no layer split for it yet.",
-                  f"To use all the GPUs: --gpus {','.join(str(i) for i in sel) if sel else '0,1'} - the experts the "
-                  "GPUs do not hold are then read through the OS file cache: faster in two reports (1.3-1.6x, #364 "
-                  f"#384), but RAM can fill up to 0 free during long prompts. Or {need:.0f} GB of RAM or more, or a "
-                  "smaller size."]
+    return why
 
 
-def low_ram_together(a, model, ram, gpu, chosen) -> bool:
-    """#364 #384: the low-RAM mode with several GPUs chosen.  One GPU is recommended: the resident variant keeps the
-    experts the GPU does not hold in RAM (steady RAM use) and has no layer split.  All the GPUs together read those
-    experts through the OS file cache instead (--mmap-experts) - 1.3-1.6x faster in those reports, but RAM can fill
-    up to 0 free during long prompts.  An explicit --gpus (or an earlier install's cards) is kept; otherwise asked,
-    one GPU by default (--yes: one GPU, as before).  True: all of them."""
-    sel = [g["index"] for g in chosen]
-    names = " + ".join(gpu_name(g) for g in chosen)
-    if a.gpus:
-        warn(f"the low-RAM mode on {names}, as you chose (--gpus): the experts the GPUs do not hold are read through "
-             "the OS file cache (the resident variant has no layer split yet), and RAM can fill up to 0 free during "
-             "long prompts")
-        say(f"       One GPU keeps them in RAM (steady RAM use, recommended): --gpu {gpu['index']}")
-        if a.low_ram == "resident":
-            warn("--low-ram resident has no layer split yet: the experts are read through the OS file cache instead")
-        return True
-    if a.low_ram != "resident" and not a.yes:
-        say()
-        for line in low_ram_one_gpu_why(model, ram, a.low_ram, sel):
-            say("  " + line)
-        say(f"  1) {gpu_name(gpu)} only: the experts it does not hold kept in RAM where they fit   (recommended: "
-            "steady RAM use)")
-        say(f"  2) {names} together: the experts the GPUs do not hold read through the OS file cache - faster")
-        say("     in two reports (1.3-1.6x, #364 #384), but RAM can fill up to 0 free during long prompts")
-        if ask("Low-RAM mode: which GPUs?", ["1", "2"], "1", a.yes) == "2":
-            ok(f"the low-RAM mode on {names}: the experts read through the OS file cache, as you chose")
-            return True
-        warn("the low-RAM mode: using " + gpu_name(gpu) + " only")
-        return False
-    warn("the low-RAM mode: using " + gpu_name(gpu) + " only (recommended)")
-    for line in low_ram_one_gpu_why(model, ram, a.low_ram, sel):
-        say("       " + line)
-    return False
+def low_ram_together(a, model, ram, chosen) -> None:
+    """The low-RAM mode with several GPUs chosen.  The engine runs its resident variant on a layer split (each card
+    keeps the most-used experts of its own layers, the RAM copy leaves out what any card holds), so the cards are
+    used together; --low-ram mmap keeps the mapped variant."""
+    for line in low_ram_why(model, ram, a.low_ram):
+        say("  " + line)
+    ok("the low-RAM mode on " + " + ".join(gpu_name(g) for g in chosen) + ": each card holds the most-used experts "
+       "of its own layers, the rest stay in RAM")
 
 
 def unsloth_together(a, model, ram, gpu, chosen) -> bool:
@@ -2684,7 +2634,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
         cfg = offer_together(cfg_path, cfg, yes)
     use = gpu if gpu is not None else cfg.get("gpu")
     # #364 #384: a resident low-RAM config on several GPUs; #498: a UD-Q4_K_XL config with its RAM budget (by hand)
-    if isinstance(use, list) and (split_mmap(cfg) | split_budget(cfg)):
+    if isinstance(use, list) and split_budget(cfg):
         write_config(cfg_path, cfg)
     if cfg.get("backend") == "hip":
         pass
@@ -3255,8 +3205,8 @@ def main() -> int:
         warn(f"--resident-budget-gib is for UD-Q4_K_XL: {model} keeps all of its experts in RAM or in the low-RAM mode")
     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
                                   (a.low_ram == "auto" and low_ram_needed(model, ram)))
-    if low_ram and multi and not low_ram_together(a, model, ram, gpu, chosen):
-        multi, sel, chosen = [], [gpu["index"]], [gpu]
+    if low_ram and multi:
+        low_ram_together(a, model, ram, chosen)
     # (the low-RAM mode's variant is decided once the context is known, below; on several GPUs it is the mapped one)
     if not low_ram and budget is None and ram < MODELS[model]["ram_gb"] - 4:
         confirm_paging(model, ram, a.low_ram, a.yes, bool(a.model))
@@ -3347,14 +3297,20 @@ def main() -> int:
         share = low_ram_gpu_share(model, vram, ctx, kv)
         rest = arena - low_ram_gpu_gb(model, vram, ctx, kv)
         resident = a.low_ram == "resident" or (a.low_ram != "mmap" and low_ram_resident(model, ram, vram, ctx, kv))
-        if multi:      # #364 #384: every chosen card's share (the image encoder on the main one), the mapped variant
+        if multi:      # every chosen card's share (the image encoder on the main one)
             held = min(arena, low_ram_gpu_gb(model, vram, ctx, kv) +
                        sum(low_ram_gpu_gb(model, x["vram_gb"], ctx, kv) for x in chosen[1:]))
-            share, resident = held / arena, False
-            ok(f"low-RAM mode on {len(chosen)} GPUs: {model}'s experts ({arena:.0f} GB) are read from the model folder "
-               f"through the OS file cache instead of a copy in RAM ({ram:.0f} GB); the GPUs hold ~{100 * share:.0f}% "
-               "of them")
-            if share < 0.6:
+            share, rest = held / arena, arena - held
+            resident = a.low_ram != "mmap"
+            if resident:   # the engine keeps the hottest of the rest when not all of it fits (#467)
+                ok(f"low-RAM mode on {len(chosen)} GPUs: they hold ~{100 * share:.0f}% of {model}'s experts "
+                   f"({arena:.0f} GB) and the other ~{rest:.0f} GB stay in RAM ({ram:.0f} GB), read once from a copy "
+                   "in the model folder")
+            else:
+                ok(f"low-RAM mode on {len(chosen)} GPUs: {model}'s experts ({arena:.0f} GB) are read from the model "
+                   f"folder through the OS file cache instead of a copy in RAM ({ram:.0f} GB); the GPUs hold "
+                   f"~{100 * share:.0f}% of them")
+            if not resident and share < 0.6:
                 warn("most of the experts are read from the SSD while it answers: expect it to be much slower than "
                      "with enough RAM (a faster SSD and a smaller size help)")
         elif resident:

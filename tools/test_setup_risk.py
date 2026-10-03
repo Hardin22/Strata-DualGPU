@@ -184,79 +184,43 @@ class BrokenEarlierConfig(unittest.TestCase):
 
 
 class LowRamGpus(unittest.TestCase):
-    """S2/S3 (#364 #384): one GPU recommended in the low-RAM mode, all of them when asked for."""
+    """The dual-GPU fork: the low-RAM mode's resident variant runs on a layer split, so several GPUs are used
+    together and the experts no card holds stay in RAM (--low-ram mmap keeps the mapped variant)."""
 
-    def test_explicit_gpus_are_kept_with_the_mapped_variant(self):
+    def test_two_gpus_keep_the_experts_in_ram(self):
         for prof, model in (("32GB-2x24GB", "IQ3_XXS"), ("32GB-2x24GB", "Q2_0"), ("47GB-2x16GB", "IQ3_XXS")):
-            with self.subTest(prof=prof, model=model):
-                ram, found = PROFILES[prof]
-                code, out, cfg, _ = install(ram, found, ["--family", "qwen", "--model", model, "--no-start",
-                                                         "--gpus", "0,1"])
-                self.assertEqual(code, 0, out)
-                self.assertEqual(cfg["gpu"], [0, 1])
-                self.assertEqual(cfg["layer_split"], "auto")
-                self.assertIn("--mmap-experts", cfg["args"])
-                self.assertNotIn("--resident-experts", cfg["args"])
-                self.assertIn("as you chose (--gpus)", out)
-                self.assertIn("RAM can fill up to 0 free", out)
-                self.assertIn("low-RAM mode on 2 GPUs", out)
+            for extra in ([], ["--gpus", "0,1"]):
+                with self.subTest(prof=prof, model=model, extra=extra):
+                    ram, found = PROFILES[prof]
+                    code, out, cfg, asked = install(ram, found, ["--family", "qwen", "--model", model, "--no-start"]
+                                                    + extra)
+                    self.assertEqual(code, 0, out)
+                    self.assertEqual(cfg["gpu"], [0, 1])
+                    self.assertEqual(cfg["layer_split"], "auto")
+                    self.assertIn("--resident-experts", cfg["args"])
+                    self.assertNotIn("--mmap-experts", cfg["args"])
+                    self.assertIn("low-RAM mode on 2 GPUs", out)
+                    self.assertFalse(any("Low-RAM mode" in q for q in asked), asked)
 
     def test_the_share_counts_every_card(self):
         ram, found = PROFILES["47GB-2x16GB"]                              # #384: 2 x 16 GB, 47 GB, IQ3_XXS at 64K
         code, out, cfg, _ = install(ram, found, ["--family", "qwen", "--model", "IQ3_XXS", "--no-start",
                                                  "--gpus", "0,1"])
         one = setup.low_ram_gpu_gb("IQ3_XXS", 15.9, 65536, "int8")
-        self.assertIn(f"the GPUs hold ~{100 * 2 * one / setup.MODELS['IQ3_XXS']['arena_gb']:.0f}% of them", out)
+        self.assertIn(f"they hold ~{100 * 2 * one / setup.MODELS['IQ3_XXS']['arena_gb']:.0f}% of IQ3_XXS's experts", out)
 
-    def test_asked_and_answered_two(self):
-        ram, found = PROFILES["32GB-2x24GB"]
-        code, out, cfg, asked = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start"],
-                                        answers={"Low-RAM mode: which GPUs?": "2"})
-        self.assertEqual(code, 0, out)
-        self.assertTrue(any("Low-RAM mode: which GPUs? [1]" in q for q in asked), asked)
-        self.assertEqual(cfg["gpu"], [0, 1])
-        self.assertIn("--mmap-experts", cfg["args"])
-        self.assertIn("1) GPU 0 (NVIDIA GeForce RTX 3090, 24 GB) only", out)
-
-    def test_yes_and_enter_keep_one_gpu(self):
-        ram, found = PROFILES["32GB-2x24GB"]
-        for answers in (None, ""):
-            code, out, cfg, _ = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start"],
-                                        answers=answers)
-            self.assertEqual(code, 0, out)
-            self.assertEqual(cfg["gpu"], 0)
-            self.assertIn("--resident-experts", cfg["args"])
-
-    def test_low_ram_resident_with_gpus(self):
+    def test_low_ram_mmap_keeps_the_mapped_variant(self):
         ram, found = PROFILES["32GB-2x24GB"]
         code, out, cfg, _ = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start", "--gpus", "0,1",
-                                                 "--low-ram", "resident"])
+                                                 "--low-ram", "mmap"])
         self.assertEqual(code, 0, out)
         self.assertEqual(cfg["gpu"], [0, 1])
         self.assertIn("--mmap-experts", cfg["args"])
-        self.assertIn("--low-ram resident has no layer split yet", out)
-
-    def test_low_ram_resident_alone_keeps_one_gpu_without_asking(self):
-        ram, found = PROFILES["32GB-2x24GB"]
-        code, out, cfg, asked = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start",
-                                                     "--low-ram", "resident"], answers="")
-        self.assertEqual(code, 0, out)
-        self.assertEqual(cfg["gpu"], 0)
-        self.assertFalse(any("Low-RAM mode" in q for q in asked), asked)
+        self.assertIn("through the OS file cache", out)
 
 
 class StartOnSeveralGpus(unittest.TestCase):
-    """A resident low-RAM config started on several GPUs reads the experts through the file cache (#364 #384)."""
-
-    def test_split_mmap(self):
-        cfg = {"args": ["--pack", "p", "--resident-experts", "--kv", "int8"]}
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertTrue(setup.split_mmap(cfg))
-            self.assertFalse(setup.split_mmap(cfg))
-            self.assertFalse(setup.split_mmap({"args": ["--mmap-experts"]}))
-        self.assertEqual(cfg["args"], ["--pack", "p", "--mmap-experts", "--kv", "int8"])
-        self.assertIn("no layer split yet", out.getvalue())
+    """A resident low-RAM config started on several GPUs keeps its resident variant (the engine splits it)."""
 
     def offer(self, args, stdin):
         found = PROFILES["32GB-2x24GB"][1]
@@ -268,15 +232,14 @@ class StartOnSeveralGpus(unittest.TestCase):
                 code, out, asked = run(setup.offer_together, p, cfg, stdin is None, stdin=stdin)
             return code, out, asked, json.loads(p.read_text())
 
-    def test_offer_together_recommends_one_gpu_for_a_resident_config(self):
+    def test_offer_together_takes_both_for_a_resident_config(self):
         code, out, asked, cfg = self.offer(["--resident-experts"], None)       # --yes: the recommendation
         self.assertIsNone(code, out)
-        self.assertNotIn("gpu", cfg)
-        self.assertEqual(cfg["args"], ["--resident-experts"])
-        code, out, asked, cfg = self.offer(["--resident-experts"], "y")
-        self.assertIn("[n]", asked[0])
         self.assertEqual(cfg["gpu"], [0, 1])
-        self.assertEqual(cfg["args"], ["--mmap-experts"])
+        self.assertEqual(cfg["args"], ["--resident-experts"])
+        code, out, asked, cfg = self.offer(["--resident-experts"], "")
+        self.assertIn("[y]", asked[0])
+        self.assertEqual(cfg["gpu"], [0, 1])
         code, out, asked, cfg = self.offer(["--mmap-experts"], None)           # other configs: as before
         self.assertEqual(cfg["gpu"], [0, 1])
 
@@ -296,8 +259,7 @@ class StartOnSeveralGpus(unittest.TestCase):
             cfg = json.loads(p.read_text())
         self.assertIsNone(code, out)
         self.assertEqual(cfg["gpu"], [0, 1])
-        self.assertEqual(cfg["args"], ["--mmap-experts"])
-        self.assertIn("no layer split yet", out)
+        self.assertEqual(cfg["args"], ["--resident-experts"])
         self.assertTrue(call.called)
 
 

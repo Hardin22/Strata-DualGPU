@@ -233,12 +233,16 @@
     "131072",
     "--kv",
     "int8",
-    "--mmap-experts"
+    "--resident-experts"
    ],
    "cwd": "<T>",
    "exe": "<T>/engine/<EXE>",
-   "gpu": 0,
+   "gpu": [
+    0,
+    1
+   ],
    "gpus_asked": true,
+   "layer_split": "auto",
    "lib_dirs": [
     "<cuda>"
    ],
@@ -274,12 +278,16 @@
     "131072",
     "--kv",
     "int8",
-    "--mmap-experts"
+    "--resident-experts"
    ],
    "cwd": "<T>",
    "exe": "<T>/engine/<EXE>",
-   "gpu": 0,
+   "gpu": [
+    0,
+    1
+   ],
    "gpus_asked": true,
+   "layer_split": "auto",
    "lib_dirs": [
     "<cuda>"
    ],
@@ -319,8 +327,12 @@
    ],
    "cwd": "<T>",
    "exe": "<T>/engine/<EXE>",
-   "gpu": 0,
+   "gpu": [
+    0,
+    1
+   ],
    "gpus_asked": true,
+   "layer_split": "auto",
    "lib_dirs": [
     "<cuda>"
    ],
@@ -360,8 +372,12 @@
    ],
    "cwd": "<T>",
    "exe": "<T>/engine/<EXE>",
-   "gpu": 0,
+   "gpu": [
+    0,
+    1
+   ],
    "gpus_asked": true,
+   "layer_split": "auto",
    "lib_dirs": [
     "<cuda>"
    ],
@@ -401,12 +417,16 @@
     "65536",
     "--kv",
     "int8",
-    "--mmap-experts"
+    "--resident-experts"
    ],
    "cwd": "<T>",
    "exe": "<T>/engine/<EXE>",
-   "gpu": 0,
+   "gpu": [
+    0,
+    1
+   ],
    "gpus_asked": true,
+   "layer_split": "auto",
    "lib_dirs": [
     "<cuda>"
    ],
@@ -446,8 +466,12 @@
    ],
    "cwd": "<T>",
    "exe": "<T>/engine/<EXE>",
-   "gpu": 0,
+   "gpu": [
+    0,
+    1
+   ],
    "gpus_asked": true,
+   "layer_split": "auto",
    "lib_dirs": [
     "<cuda>"
    ],

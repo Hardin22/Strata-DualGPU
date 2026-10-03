@@ -778,6 +778,90 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
+# ---- a layer split's card order and VRAM reserves (the dual-GPU fork; docs/DUAL_GPU.md)
+SPLIT_RESERVE_DISPLAY_MIB = 1800    # a card that drives monitors: the desktop, a browser and the compositor grow on it
+SPLIT_RESERVE_HEADLESS_MIB = 300    # a card that drives none: nothing else allocates there
+
+
+def split_order(speeds: dict, gpus: list) -> list:
+    """The cards of a layer split, slowest first and fastest last.  The last stage also runs the output head, the
+    draft layer and the draft chain every speculative window waits for, so on a 4060 Ti + 5080 the 5080 last decoded
+    ~12% faster than the other way round.  `speeds`: a relative speed per card (nvidia-smi's numbering); equal or
+    unknown speeds keep the config's order."""
+    return sorted(gpus, key=lambda i: speeds.get(i, 0.0))
+
+
+def split_reserves(display: dict, gpus: list, args: list) -> list:
+    """The engine's arguments with --vram-reserve-mib (the first card) and --vram-reserve-later-mib (the later ones)
+    when the config gives neither: SPLIT_RESERVE_DISPLAY_MIB on a card that drives a display, else
+    SPLIT_RESERVE_HEADLESS_MIB.  A reserve the config gives is kept; one card, or no display information, changes
+    nothing."""
+    args = list(args)
+    if len(gpus) < 2 or not display:
+        return args
+    want = lambda i: SPLIT_RESERVE_DISPLAY_MIB if display.get(i) else SPLIT_RESERVE_HEADLESS_MIB
+    if "--vram-reserve-mib" not in args:
+        args += ["--vram-reserve-mib", str(want(gpus[0]))]
+    if "--vram-reserve-later-mib" not in args:
+        args += ["--vram-reserve-later-mib", str(max(want(i) for i in gpus[1:]))]
+    return args
+
+
+def card_speeds(exe: str, gpus: list, env: dict) -> dict:
+    """SMs x GHz of each card (what the engine's split search prices a layer with), from `strata --list-gpus` run on
+    exactly these cards; {} when the engine cannot say (an older engine, a HIP build, no driver)."""
+    e = dict(env, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=",".join(str(i) for i in gpus))
+    try:
+        r = subprocess.run([exe, "--list-gpus"], capture_output=True, text=True, env=e, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    speeds = {}
+    for line in r.stdout.splitlines():
+        m = re.match(r"gpu (\d+) sms=(\d+) khz=(\d+)", line)
+        if m and int(m.group(1)) < len(gpus):
+            speeds[gpus[int(m.group(1))]] = int(m.group(2)) * int(m.group(3)) / 1e6
+    return speeds
+
+
+def card_displays() -> dict:
+    """Whether each NVIDIA card (nvidia-smi's numbering) drives a display; {} when nvidia-smi cannot say."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,display_active", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out = {}
+    for line in r.stdout.splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) == 2 and f[0].isdigit():
+            out[int(f[0])] = f[1].lower() == "enabled"
+    return out
+
+
+def plan_split(cfg: dict, exe: str) -> dict:
+    """A config that splits the layers across NVIDIA cards, with the order and the reserves worked out: with
+    "layer_split" auto (the default) the cards are ordered fastest last ("gpu_order": "as_given" keeps the config's
+    order; an explicit split such as "20" keeps it too, since it was chosen for that order), and the reserves follow
+    the display unless the config gives them ("vram_reserve": "as_given" turns that off)."""
+    gpus = gpu_list(cfg)
+    if len(gpus) < 2 or cfg.get("backend") == "hip":
+        return cfg
+    cfg = dict(cfg)
+    if cfg.get("gpu_order", "auto") == "auto" and str(cfg.get("layer_split") or "auto") == "auto":
+        order = split_order(card_speeds(exe, gpus, child_env(cfg)), gpus)
+        if order != gpus:
+            print(f"[strata] layer split: GPUs {order}, the fastest last (it also runs the head and the draft layer; "
+                  f'"gpu_order": "as_given" keeps the config\'s order)', flush=True)
+            cfg["gpu"] = order
+    if cfg.get("vram_reserve", "auto") == "auto":
+        args = split_reserves(card_displays(), gpu_list(cfg), cfg["args"])
+        if args != cfg["args"]:
+            print("[strata] VRAM reserves: " + " ".join(args[len(cfg["args"]):]) + " (a card driving a display keeps "
+                  f"{SPLIT_RESERVE_DISPLAY_MIB} MiB free, one without {SPLIT_RESERVE_HEADLESS_MIB})", flush=True)
+            cfg["args"] = args
+    return cfg
+
+
 def engine_silence_s(cfg: dict) -> float:
     """#481: the config's "engine_silence_s" - seconds an engine may print nothing during a request before the server
     ends it (default ENGINE_SILENCE_S; 0 = wait forever).  ValueError for anything but a number >= 0."""
@@ -2895,6 +2979,10 @@ def main() -> int:
         if not cfg:
             ap.error("--engine strata needs --config")
         vision = None
+        # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
+        # it is told about (WinError 2), so it is made absolute here
+        exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
+        cfg = plan_split(cfg, exe)
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
@@ -2915,9 +3003,6 @@ def main() -> int:
               "loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
-        # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
-        # it is told about (WinError 2), so it is made absolute here
-        exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
         except ValueError as e:

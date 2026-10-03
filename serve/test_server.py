@@ -616,6 +616,39 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("HIP_VISIBLE_DEVICES"), os.environ.get("HIP_VISIBLE_DEVICES"))
 
 
+class SplitPlan(unittest.TestCase):
+    """The dual-GPU fork: a layer split's cards fastest last, and the VRAM reserves from which card drives a display."""
+
+    def test_order(self):
+        from serve.server import split_order
+        self.assertEqual(split_order({0: 220.0, 1: 86.0}, [0, 1]), [1, 0])     # 5080 + 4060 Ti: the 5080 last
+        self.assertEqual(split_order({0: 86.0, 1: 220.0}, [0, 1]), [0, 1])
+        self.assertEqual(split_order({0: 150.0, 1: 150.0}, [1, 0]), [1, 0])    # a tie keeps the config's order
+        self.assertEqual(split_order({}, [1, 0]), [1, 0])                     # nothing known: unchanged
+
+    def test_reserves(self):
+        from serve.server import SPLIT_RESERVE_DISPLAY_MIB as D, SPLIT_RESERVE_HEADLESS_MIB as N, split_reserves
+        self.assertEqual(split_reserves({0: True, 1: False}, [1, 0], ["--x"]),
+                         ["--x", "--vram-reserve-mib", str(N), "--vram-reserve-later-mib", str(D)])
+        self.assertEqual(split_reserves({0: True, 1: False}, [0, 1], []),
+                         ["--vram-reserve-mib", str(D), "--vram-reserve-later-mib", str(N)])
+        given = ["--vram-reserve-mib", "700"]                                  # the config's own reserve is kept
+        self.assertEqual(split_reserves({0: True, 1: False}, [1, 0], given),
+                         given + ["--vram-reserve-later-mib", str(D)])
+        self.assertEqual(split_reserves({}, [1, 0], ["--x"]), ["--x"])          # no nvidia-smi: unchanged
+        self.assertEqual(split_reserves({0: True}, [0], ["--x"]), ["--x"])      # one card: unchanged
+
+    def test_plan_keeps_an_explicit_split(self):
+        from serve import server
+        cfg = {"gpu": [0, 1], "layer_split": "20", "args": [], "vram_reserve": "as_given"}
+        with mock.patch.object(server, "card_speeds", return_value={0: 220.0, 1: 86.0}):
+            self.assertEqual(server.plan_split(cfg, "strata")["gpu"], [0, 1])  # "20" was chosen for this order
+            auto = dict(cfg, layer_split="auto")
+            self.assertEqual(server.plan_split(auto, "strata")["gpu"], [1, 0])
+            self.assertEqual(server.plan_split(dict(auto, gpu_order="as_given"), "strata")["gpu"], [0, 1])
+        self.assertEqual(cfg["gpu"], [0, 1])                                   # the caller's config is not changed
+
+
 class RecordingPrompt(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_ids = list(ids)

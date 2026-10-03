@@ -95,6 +95,10 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         }
 
         if (affinity == PoolAffinity::All || !topo.is_hybrid) {
+            // a hybrid CPU: the P-cores first (the host takes the first of them), so a pool smaller than the core
+            // count runs on the P-cores and the first E-cores rather than on whatever the OS numbered first
+            std::stable_sort(descs.begin(), descs.end(),
+                             [](const CoreDesc& x, const CoreDesc& y) { return x.efficiency > y.efficiency; });
             for (const auto& c : descs) topo.worker_cores.push_back(c.lps[0]);
             if (skip_first && !topo.worker_cores.empty()) {
                 topo.host_core = topo.worker_cores.front();
@@ -219,6 +223,9 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     }
 
     if (affinity == PoolAffinity::All || !topo.is_hybrid) {
+        if (topo.is_hybrid)   // the P-cores first (see the Windows branch)
+            std::stable_sort(all_cpus.begin(), all_cpus.end(),
+                             [](const CoreLinux& x, const CoreLinux& y) { return x.cap > y.cap; });
         for (const auto& cl : all_cpus) {
             if (!cl.is_sibling) topo.worker_cores.push_back(cl.cpu);
         }
@@ -350,6 +357,12 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
         n_ = n_workers;
     } else if (topo_.is_hybrid && affinity_ != PoolAffinity::All) {
         n_ = (std::max)(1, topo_.p_cores - 1);
+    } else if (topo_.is_hybrid) {
+        // A hybrid CPU, one worker per physical core (the P-cores first, see detect_cpu_topology): the P-cores but
+        // the host's and HALF of the E-cores.  An E-core runs the expert kernels ~2.2x slower than a P-core, and a
+        // layer waits for its slowest part.  i9-14900KF (8P + 16E), two GPUs pipelined: 15 workers decoded 165 / 116
+        // tok/s (code / prose) against 106 / 84 with all 23; 7 or 11 were slower than 15.  --pool-workers N: any count.
+        n_ = (std::max)(1, (std::min)((int) topo_.worker_cores.size(), topo_.p_cores - 1 + topo_.e_cores / 2));
     } else {
         n_ = (int) topo_.worker_cores.size();
     }
