@@ -93,7 +93,13 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // measured-fastest rule, but a token's expert rows then round differently alone than in a group, so greedy output
     // can depend on how many drafts a verify window held.  STRATA_IQ_MT_MIN=1 (opt-in, 0.1.30) uses the multi-token
     // kernels for every group: output independent of the drafting, at a measured -1..-3% decode on IQ3_S (AVX-512).
-    static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 2; }();
+    static const char* mt_env = std::getenv("STRATA_IQ_MT_MIN");
+    static const int mt_min = mt_env ? std::atoi(mt_env) : 2;
+    // A format the AVX-2 kernel runs faster than ggml even for one token (iq256_one_token: IQ3_S on Intel) takes it for
+    // one token too, on a CPU without AVX-512: in decode most CPU experts serve one token of the window (~1.2 on
+    // average).  Measured with the IQ3_XXS model on a 14900KF: the 5080 stage's CPU expert time per window -4%.
+    static const bool cpu512 = cpu_avx512_ok();
+    const int mt_here = mt_env == nullptr && !cpu512 && iq256_one_token(f.gu_type) ? 1 : mt_min;
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
@@ -105,8 +111,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
     // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
     // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
-    static const bool cpu512 = cpu_avx512_ok();
-    if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
+    if (nt >= mt_here && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;

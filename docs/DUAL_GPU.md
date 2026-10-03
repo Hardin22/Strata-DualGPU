@@ -154,8 +154,25 @@ so about 2,400 of them were read from the SSD in one benchmark run. With 2,174 m
 none are read from the SSD. The automatic split still picks K=20 for it.
 
 More experts in VRAM means more of them computed by the GPU, which rounds differently from the CPU (see
-[Is the output still the same model?](#is-the-output-still-the-same-model)). On the 5,335 tokens of that comparison, IQ3_XXS with and without trimming picked the same top token at 93.5%
-of the positions, with a perplexity of 6.95 and 7.03.
+[Is the output still the same model?](#is-the-output-still-the-same-model)). On the 5,335 tokens of that comparison,
+IQ3_XXS with and without trimming picked the same top token at 93.5% of the positions, with a perplexity of 6.95 and
+7.03.
+
+## 10. The CPU's experts
+
+The experts no GPU cache holds are computed by the CPU pool. With IQ3_XXS that was the 5080 stage's largest wait,
+about 5 ms of a 21 ms window. Three changes to the AVX-2 kernels:
+
+- the IQ3_S, IQ3_XXS and IQ2_S grid entries are read with one gather on the P-cores (the E-cores gather slower than
+  they insert, so they keep the old decode)
+- on 12th-gen Intel and later, AVX-VNNI instructions do two multiply steps in one
+- IQ3_S takes the multi-token kernel for a single token too: ggml's single-token dot was almost twice as slow on a
+  P-core, and most experts the CPU computes in decode serve one token of the window
+
+The first two give the same bits as before. One IQ3_S expert on a P-core went from 0.52 to 0.36 ms at three tokens
+and from 0.39 to 0.25 ms at one. The engine gains less, mostly because the E-cores gain little: same engine, all three
+against none, the 5080 stage's CPU time went from 5.3 to 4.8 ms per window, code from 135 to 139 tok/s and prose
+from 96 to 98 (IQ3_XXS). IQ2_XS stays within the noise.
 
 ## Where it ended up
 
@@ -213,5 +230,7 @@ seeded sampling, and runs with forced rollbacks.
 | `STRATA_DF_BRANCH=0` | no side streams inside the verify graph |
 | `STRATA_NO_ECOQOS=0` | leave Windows power throttling on |
 | `STRATA_HOST_CPU=n` | pin the host loop to logical CPU n |
+| `STRATA_IQ_GATHER=0` | no gathered i-quant decodes (section 10; `=1` forces them on every core) |
+| `STRATA_NO_AVXVNNI=1` | the CPU kernels without AVX-VNNI |
 | `STRATA_DECODE_TIMING=1` | per-window host and per-stage GPU timings in the engine log |
 | `STRATA_PIPELINE_TRACE=<file>` | a timeline of the pipelined loop |

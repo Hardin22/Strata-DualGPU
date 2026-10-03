@@ -17,6 +17,11 @@
 #include "ggml-common.h"
 
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
 
 #include <cmath>
 #include <cstdlib>
@@ -24,6 +29,79 @@
 
 namespace strata::kernels::cpu {
 namespace {
+
+void cpuid(int leaf, int sub, int r[4]) {
+#if defined(_MSC_VER)
+    __cpuidex(r, leaf, sub);
+#else
+    unsigned a, b, c, d;
+    __cpuid_count((unsigned) leaf, (unsigned) sub, a, b, c, d);
+    r[0] = (int) a; r[1] = (int) b; r[2] = (int) c; r[3] = (int) d;
+#endif
+}
+
+// Whether the calling thread runs on a core whose vpgatherdd beats eight scalar loads and inserts: an Intel core,
+// on a hybrid CPU only the performance cores (CPUID 1Ah core type 40h; the E-cores, 20h, gather slower than they
+// insert).  AMD Zen 2/3 gather slowly, so they keep the inserts.  Asked once per thread: the pool pins its workers
+// to one core each, and a CPUID can cost a microsecond under a hypervisor (Windows with VBS).  STRATA_IQ_GATHER=0/1
+// forces it.
+int cpu_vendor() {   // 0 = other, 1 = Intel non-hybrid, 2 = Intel hybrid
+    static const int vendor = [] {
+        int r[4];
+        cpuid(0, 0, r);
+        if (!(r[1] == 0x756e6547 && r[3] == 0x49656e69 && r[2] == 0x6c65746e)) return 0;   // "GenuineIntel"
+        cpuid(7, 0, r);
+        return ((r[3] >> 15) & 1) ? 2 : 1;
+    }();
+    return vendor;
+}
+
+bool gather_fast() {
+    static const int forced = [] { const char* v = std::getenv("STRATA_IQ_GATHER"); return v ? std::atoi(v) : -1; }();
+    if (forced >= 0) return forced != 0;
+    const int vendor = cpu_vendor();
+    if (vendor != 2) return vendor == 1;
+    thread_local int on_p = -1;
+    if (on_p < 0) {
+        int r[4];
+        cpuid(0x1A, 0, r);
+        on_p = (((unsigned) r[0] >> 24) == 0x40) ? 1 : 0;
+    }
+    return on_p == 1;
+}
+
+// AVX-VNNI (Intel Alder Lake and later, P- and E-cores; CPUID 7.1:EAX[4]): vpdpwssd does a madd and its add in one
+// uop, vpdpbusd a maddubs and a madd(ones).  Every kernel below has a VN variant that uses them; the integer sums are
+// the same, so the results are bit for bit those of the plain AVX2 form.  MSVC emits the intrinsics under /arch:AVX2;
+// GCC/Clang only with -mavxvnni, otherwise VN changes nothing.  STRATA_NO_AVXVNNI=1 turns them off.
+#if defined(_MSC_VER) || defined(__AVXVNNI__)
+#define STRATA_IQ_VNNI 1
+#else
+#define STRATA_IQ_VNNI 0
+#endif
+bool avx_vnni() {
+    static const bool on = [] {
+        if (const char* v = std::getenv("STRATA_NO_AVXVNNI"); v != nullptr && std::atoi(v) != 0) return false;
+        int r[4];
+        cpuid(7, 1, r);
+        return STRATA_IQ_VNNI && ((r[0] >> 4) & 1) != 0;
+    }();
+    return on;
+}
+template <bool VN>
+inline __m256i madd_add(__m256i acc, __m256i p16, __m256i sc) {   // acc + madd(p16, sc)
+#if STRATA_IQ_VNNI
+    if constexpr (VN) return _mm256_dpwssd_avx_epi32(acc, p16, sc);
+#endif
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(p16, sc));
+}
+template <bool VN>
+inline __m256i dot4u(__m256i u8, __m256i s8) {   // four u8 x s8 products per int32 lane
+#if STRATA_IQ_VNNI
+    if constexpr (VN) return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), u8, s8);
+#endif
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(u8, s8), _mm256_set1_epi16(1));
+}
 
 inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
 inline uint32_t u32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
@@ -177,6 +255,78 @@ template <> struct Fmt32<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4
     }
 };
 
+// ---- the gathered decodes, for the cores where gather_fast() holds
+// the 32 sign bits of a half, from the j's 8 sign bytes: one broadcast and one shuffle (sgn_vec: two and an insert)
+inline __m256i sgn_half(const uint8_t* m8, int half) {
+    const __m256i sb = _mm256_shuffle_epi8(
+        _mm256_set1_epi64x((long long) u64(m8)),
+        half ? _mm256_setr_epi8(4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7)
+             : _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3));
+    const __m256i sel = _mm256_set1_epi64x((long long) 0x8040201008040201ull);
+    return _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(sb, sel), sel), _mm256_set1_epi8(1));
+}
+// four 7-bit even-sign indices of a u32 (bits 0-6, 7-13, 14-20, 21-27) -> their four masks, one gather
+inline __m256i even_signs4(uint32_t w) {
+    const __m128i idx = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32((int) w), _mm_setr_epi32(0, 7, 14, 21)),
+                                      _mm_set1_epi32(127));
+    return _mm256_i32gather_epi64((const long long*) even_signs.v, idx, 8);
+}
+
+// IQ3_S on a core with fast gathers (an Intel P-core, see gather_fast): the same grid words and sign bytes as
+// Fmt32<21>, so the same products bit for bit.  The eight 9-bit grid indices are built in one register (8 low bits
+// from qs, the 9th from bit k of qh) and read with one gather; the scalar form spends ~7 shuffle-port uops per half
+// on vpinsrd and runs the index arithmetic on the scalar ports.  On the 14900KF's P-cores: gate/up rows of an IQ3_S
+// expert 0.41 -> 0.27 ms at three tokens; its E-cores gather slower than they insert, so they keep Fmt32<21>.
+template <> struct Fmt32<121> {
+    static constexpr int bytes = 110;
+    static constexpr float K = 1.0f;
+    static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
+        const uint8_t* q = b + 2 + 16 * j + 8 * half;
+        const uint32_t h = b[66 + 2 * j + half];
+        const __m256i lo = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) q));
+        const __m256i hb = _mm256_and_si256(_mm256_sllv_epi32(_mm256_set1_epi32((int) h),
+                                                              _mm256_setr_epi32(8, 7, 6, 5, 4, 3, 2, 1)),
+                                            _mm256_set1_epi32(0x100));
+        g = _mm256_i32gather_epi32((const int*) iq3s_grid, _mm256_or_si256(lo, hb), 4);
+        sgn = sgn_half(b + 74 + 8 * j, half);
+        const uint8_t s = b[106 + j];
+        sc = sc32(half ? 2 * (s >> 4) + 1 : 2 * (s & 15) + 1);
+    }
+};
+
+// IQ3_XXS and IQ2_S the same way: their grid entries (and IQ3_XXS's even-sign masks) read with one gather from
+// indices built in a register, and IQ2_S's explicit sign bits taken from one broadcast.  Each is its format's Fmt32
+// bit for bit.  P-core gate/up rows at three tokens: IQ3_XXS 0.26 -> 0.24 ms, IQ2_S 0.31 -> 0.27.  IQ2_XXS measured
+// 4% slower gathered (its four 8-byte grid loads are few enough already) and keeps Fmt32<16>.
+template <> struct Fmt32<118> {   // IQ3_XXS, gathered
+    static constexpr int bytes = 98;
+    static constexpr float K = 0.25f;
+    static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
+        const uint8_t* q = b + 2 + 16 * j + 8 * half;
+        g = _mm256_i32gather_epi32((const int*) iq3xxs_grid, _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) q)), 4);
+        const uint32_t w = u32(b + 2 + 64 + 8 * j + 4 * half);
+        sgn = even_signs4(w);
+        sc = sc32(2 * (int) (w >> 28) + 1);
+    }
+};
+
+template <> struct Fmt32<122> {   // IQ2_S, gathered
+    static constexpr int bytes = 82;
+    static constexpr float K = 0.125f;
+    static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
+        const uint8_t* qs = b + 2 + 8 * j + 4 * half;
+        const uint32_t h = b[66 + 2 * j + half];
+        // index k: qs byte k | bits 2k, 2k+1 of qh at bits 8-9
+        const __m128i idx = _mm_or_si128(
+            _mm_cvtepu8_epi32(_mm_cvtsi32_si128((int) u32(qs))),
+            _mm_and_si128(_mm_sllv_epi32(_mm_set1_epi32((int) h), _mm_setr_epi32(8, 6, 4, 2)), _mm_set1_epi32(0x300)));
+        g = _mm256_i32gather_epi64((const long long*) iq2s_grid, idx, 8);
+        sgn = sgn_half(b + 2 + 32 + 8 * j, half);
+        const uint8_t sb = b[74 + 2 * j + half];
+        sc = sc16(2 * (sb & 15) + 1, 2 * (sb >> 4) + 1);
+    }
+};
+
 template <> struct Fmt32<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 136 B, 8 signed sub-scales
     // ggml's ggml_vec_dot_iq4_xs_q8_K: the same 16-value codebook as IQ4_NL, but each of the eight 32-value
     // sub-blocks carries its own 6-bit scale, read as two nibbles of scales_l[p] plus two bits of scales_h, and
@@ -199,7 +349,7 @@ template <> struct Fmt32<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 
     }
 };
 
-template <int TY, int NT>
+template <int TY, int NT, bool VN>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     __m256 accf[NT];
     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
@@ -216,7 +366,7 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
                 for (int t = 0; t < NT; ++t) {
                     const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + off));
                     const __m256i ys = _mm256_sign_epi8(yv, sgn);
-                    acci[t] = _mm256_add_epi32(acci[t], _mm256_madd_epi16(_mm256_maddubs_epi16(g, ys), sc));
+                    acci[t] = madd_add<VN>(acci[t], _mm256_maddubs_epi16(g, ys), sc);
                 }
             }
         }
@@ -233,7 +383,7 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
 // 32-byte load.  The 8 scale bytes become all 16 half-scales with ggml's unpack trick.  The grid lookups
 // stay scalar loads into set_epi64x (ggml does the same).  Every token still only pays a load, a sign,
 // a maddubs, a madd and an add per half, into alternating accumulators.
-template <int NT>
+template <int NT, bool VN>
 inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     static const uint8_t bit_sel[32] = {
         1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80, 1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80,
@@ -302,8 +452,7 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
                 for (int t = 0; t < NT; ++t) {
                     const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + off));
                     const __m256i ys = _mm256_sign_epi8(yv, sgn);
-                    acc[t][h & 1] = _mm256_add_epi32(acc[t][h & 1],
-                        _mm256_madd_epi16(_mm256_maddubs_epi16(g, ys), sc));
+                    acc[t][h & 1] = madd_add<VN>(acc[t][h & 1], _mm256_maddubs_epi16(g, ys), sc);
                 }
             }
         }
@@ -315,13 +464,13 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
 }
 
-template <int TY, int NT>
+template <int TY, int NT, bool VN>
 inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
-    if constexpr (TY == 17) row_dot_iq2xs<NT>(row, nblocks, y, res);
-    else                    row_dot<TY, NT>(row, nblocks, y, res);
+    if constexpr (TY == 17) row_dot_iq2xs<NT, VN>(row, nblocks, y, res);
+    else                    row_dot<TY, NT, VN>(row, nblocks, y, res);
 }
 
-template <int TY, int NT>
+template <int TY, int NT, bool VN>
 void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, float* const* ff,
              int r0, int r1) {
     const block_q8_K* y[NT];
@@ -329,51 +478,65 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     const int nb = n / QK_K;
     float g[NT], u[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
-        row_dot_any<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
+        row_dot_any<TY, NT, VN>(blob + (size_t) r * gu_row, nb, y, g);
+        row_dot_any<TY, NT, VN>(blob + up_off + (size_t) r * gu_row, nb, y, u);
         for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
     }
 }
 
-template <int TY, int NT>
+template <int TY, int NT, bool VN>
 void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     float res[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        row_dot_any<TY, NT, VN>(w + (size_t) r * row_bytes, n / QK_K, y, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
 
-template <int TY>
+template <int TY, bool VN>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
     switch (nt) {
-        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 1: gu_rows<TY, 1, VN>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 2: gu_rows<TY, 2, VN>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 3: gu_rows<TY, 3, VN>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 4: gu_rows<TY, 4, VN>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 5: gu_rows<TY, 5, VN>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 6: gu_rows<TY, 6, VN>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 7: gu_rows<TY, 7, VN>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        default: gu_rows<TY, 8, VN>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
     }
 }
 
-template <int TY>
+template <int TY, bool VN>
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
     switch (nt) {
-        case 1: dot_rows<TY, 1>(w, row_bytes, n, act, out, r0, r1); break;
-        case 2: dot_rows<TY, 2>(w, row_bytes, n, act, out, r0, r1); break;
-        case 3: dot_rows<TY, 3>(w, row_bytes, n, act, out, r0, r1); break;
-        case 4: dot_rows<TY, 4>(w, row_bytes, n, act, out, r0, r1); break;
+        case 1: dot_rows<TY, 1, VN>(w, row_bytes, n, act, out, r0, r1); break;
+        case 2: dot_rows<TY, 2, VN>(w, row_bytes, n, act, out, r0, r1); break;
+        case 3: dot_rows<TY, 3, VN>(w, row_bytes, n, act, out, r0, r1); break;
+        case 4: dot_rows<TY, 4, VN>(w, row_bytes, n, act, out, r0, r1); break;
         default: for (int t0 = 0; t0 < nt; t0 += 4) {
             const int k = nt - t0 < 4 ? nt - t0 : 4;
-            dot_rows_nt<TY>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
+            dot_rows_nt<TY, VN>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
         }
     }
+}
+
+// the VNNI choice for one format
+template <int TY>
+void gu_any(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, float* const* ff,
+            int r0, int r1) {
+    if (avx_vnni()) gu_rows_nt<TY, true>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+    else gu_rows_nt<TY, false>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+}
+template <int TY>
+void dot_any(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
+             int r1) {
+    if (avx_vnni()) dot_rows_nt<TY, true>(nt, w, row_bytes, n, act, out, r0, r1);
+    else dot_rows_nt<TY, false>(nt, w, row_bytes, n, act, out, r0, r1);
 }
 
 }  // namespace
@@ -446,15 +609,30 @@ bool iq256_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
 }
 
+bool iq256_one_token(int type) noexcept {
+    // IQ3_S on an Intel CPU: this kernel beats ggml's single-token dot at one token too (gathered on the P-cores,
+    // 0.34 -> 0.19 ms per expert's gate/up rows on a 14900KF; 0.71 -> 0.68 on its E-cores).  Other CPUs not measured.
+    return type == 21 && cpu_vendor() != 0;
+}
+
 void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
     switch (type) {
-        case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 23: gu_rows_nt<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 16: gu_any<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 17: gu_any<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 18:
+            if (gather_fast()) gu_any<118>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+            else gu_any<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+            break;
+        case 21:
+            if (gather_fast()) gu_any<121>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+            else gu_any<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+            break;
+        case 22:
+            if (gather_fast()) gu_any<122>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+            else gu_any<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+            break;
+        case 23: gu_any<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         default: break;
     }
 }
@@ -462,12 +640,21 @@ void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
 void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                 int r0, int r1) {
     switch (type) {
-        case 16: dot_rows_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 17: dot_rows_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 18: dot_rows_nt<18>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 21: dot_rows_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 23: dot_rows_nt<23>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 16: dot_any<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 17: dot_any<17>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 18:
+            if (gather_fast()) dot_any<118>(nt, w, row_bytes, n, act, out, r0, r1);
+            else dot_any<18>(nt, w, row_bytes, n, act, out, r0, r1);
+            break;
+        case 21:
+            if (gather_fast()) dot_any<121>(nt, w, row_bytes, n, act, out, r0, r1);
+            else dot_any<21>(nt, w, row_bytes, n, act, out, r0, r1);
+            break;
+        case 22:
+            if (gather_fast()) dot_any<122>(nt, w, row_bytes, n, act, out, r0, r1);
+            else dot_any<22>(nt, w, row_bytes, n, act, out, r0, r1);
+            break;
+        case 23: dot_any<23>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }
@@ -477,12 +664,11 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
 // kvalues_iq4nl pshufb decode and the |w| half of the signed x signed product.  Here both are computed once
 // per block; every token then costs a sign, a maddubs, a madd and an fmadd.  The arithmetic is ggml's - only
 // the order of the float additions differs.
-template <int NT>
+template <int NT, bool VN>
 void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* const* y, float* const* out,
                 int r0, int r1) {
     const __m128i values = _mm_loadu_si128((const __m128i*) kvalues_iq4nl);
     const __m128i m4b = _mm_set1_epi8(0x0f);
-    const __m256i ones = _mm256_set1_epi16(1);
     const int nb = n / QK4_NL;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
@@ -501,7 +687,7 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
             for (int t = 0; t < NT; ++t) {
                 const block_q8_0& b = y[t][ib];
                 const __m256i q8 = _mm256_loadu_si256((const __m256i*) b.qs);
-                const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aq, _mm256_sign_epi8(q8, q4)), ones);
+                const __m256i p = dot4u<VN>(aq, _mm256_sign_epi8(q8, q4));
                 accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * h2f(b.d)), _mm256_cvtepi32_ps(p), accf[t]);
             }
         }
@@ -513,11 +699,12 @@ void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* c
                         int r0, int r1) {
     const block_q8_0* y[8];
     for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) hq[t];
+    const bool vn = avx_vnni();
     switch (nt) {
-        case 1: iq4nl_rows<1>(w, row_bytes, n, y, out, r0, r1); break;
-        case 2: iq4nl_rows<2>(w, row_bytes, n, y, out, r0, r1); break;
-        case 3: iq4nl_rows<3>(w, row_bytes, n, y, out, r0, r1); break;
-        case 4: iq4nl_rows<4>(w, row_bytes, n, y, out, r0, r1); break;
+        case 1: vn ? iq4nl_rows<1, true>(w, row_bytes, n, y, out, r0, r1) : iq4nl_rows<1, false>(w, row_bytes, n, y, out, r0, r1); break;
+        case 2: vn ? iq4nl_rows<2, true>(w, row_bytes, n, y, out, r0, r1) : iq4nl_rows<2, false>(w, row_bytes, n, y, out, r0, r1); break;
+        case 3: vn ? iq4nl_rows<3, true>(w, row_bytes, n, y, out, r0, r1) : iq4nl_rows<3, false>(w, row_bytes, n, y, out, r0, r1); break;
+        case 4: vn ? iq4nl_rows<4, true>(w, row_bytes, n, y, out, r0, r1) : iq4nl_rows<4, false>(w, row_bytes, n, y, out, r0, r1); break;
         default: for (int t0 = 0; t0 < nt; t0 += 4) {
             const int k = nt - t0 < 4 ? nt - t0 : 4;
             iq4nl256_down_rows(w, row_bytes, n, hq + t0, k, out + t0, r0, r1);

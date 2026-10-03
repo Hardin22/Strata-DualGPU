@@ -7,8 +7,14 @@
 #include "strata/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace strata::kernels::cpu {
@@ -34,7 +40,37 @@ inline void unpack64(const uint8_t* codes, __m256i& lo, __m256i& hi) {
     hi = _mm256_set_m128i(_mm_unpackhi_epi16(b0, b1), _mm_unpacklo_epi16(b0, b1));  // values 32..63
 }
 
-template <int NT>
+// AVX-VNNI (Intel Alder Lake and later, P- and E-cores): one vpdpbusd sums four code x activation products into an
+// int32 lane, where maddubs + madd(ones) take two multiply-port uops.  The codes are 0..3, so maddubs never
+// saturates and the int32 sums are the same.  MSVC emits the intrinsic under /arch:AVX2; GCC/Clang only with
+// -mavxvnni, otherwise the maddubs form is all there is.
+#if defined(_MSC_VER) || defined(__AVXVNNI__)
+#define STRATA_Q2_VNNI 1
+inline __m256i dot4(__m256i codes, __m256i act) { return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), codes, act); }
+bool avx_vnni() {
+    static const bool on = [] {
+        if (const char* v = std::getenv("STRATA_NO_AVXVNNI"); v != nullptr && std::atoi(v) != 0) return false;
+        int r[4];
+#if defined(_MSC_VER)
+        __cpuidex(r, 7, 1);
+#else
+        unsigned a, b, c, d;
+        __cpuid_count(7, 1, a, b, c, d);
+        r[0] = (int) a;
+#endif
+        return ((r[0] >> 4) & 1) != 0;
+    }();
+    return on;
+}
+#else
+#define STRATA_Q2_VNNI 0
+inline __m256i dot4(__m256i codes, __m256i act) {
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(codes, act), _mm256_set1_epi16(1));
+}
+bool avx_vnni() { return false; }
+#endif
+
+template <int NT, bool VNNI>
 inline void row_multi(const uint8_t* row, const ActQ* const* a, int nblocks, float* res) {
     __m256 acc[NT];
     float corr[NT];
@@ -47,8 +83,9 @@ inline void row_multi(const uint8_t* row, const ActQ* const* a, int nblocks, flo
         unpack64(blk + 2, lo, hi);
         for (int t = 0; t < NT; ++t) {
             const int8_t* q = a[t]->q + b * 64;
-            const __m256i s0 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i*) q)), ones);
-            const __m256i s1 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i*) (q + 32))), ones);
+            const __m256i q0 = _mm256_loadu_si256((const __m256i*) q), q1 = _mm256_loadu_si256((const __m256i*) (q + 32));
+            const __m256i s0 = VNNI ? dot4(lo, q0) : _mm256_madd_epi16(_mm256_maddubs_epi16(lo, q0), ones);
+            const __m256i s1 = VNNI ? dot4(hi, q1) : _mm256_madd_epi16(_mm256_maddubs_epi16(hi, q1), ones);
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b]), _mm256_cvtepi32_ps(s0), acc[t]);
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b + 1]), _mm256_cvtepi32_ps(s1), acc[t]);
             corr[t] += d * (a[t]->hx[2 * b] + a[t]->hx[2 * b + 1]);
@@ -64,8 +101,10 @@ inline void row_multi(const uint8_t* row, const ActQ* const* a, int nblocks, flo
 template <int NT>
 void rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, float* const* out, int r0, int r1) {
     float res[NT];
+    const bool vnni = STRATA_Q2_VNNI && avx_vnni();
     for (int r = r0; r < r1; ++r) {
-        row_multi<NT>(w + (size_t) r * row_bytes, a, nblocks, res);
+        if (vnni) row_multi<NT, true>(w + (size_t) r * row_bytes, a, nblocks, res);
+        else row_multi<NT, false>(w + (size_t) r * row_bytes, a, nblocks, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
