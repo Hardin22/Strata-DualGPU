@@ -2827,7 +2827,12 @@ int main(int argc, char** argv) {
         while (st < (int) split_at.size() && l >= split_at[(size_t) st]) ++st;
         return st;
     };
+    // the whole ranking, hottest first, before each stage takes its own layers' share: the resident RAM copy ranks
+    // the experts no GPU holds over ALL the layers (with CUDA0's share alone, a copy that did not fit kept only layers
+    // 0..K-1's experts and read every later layer's from the files)
+    std::vector<std::pair<int32_t, int32_t>> profile_all;
     if (multi_gpu) {
+        profile_all = profile;
         std::vector<std::pair<int32_t, int32_t>> mine;
         for (const auto& pr : profile) {
             const int st = stage_of(pr.first);
@@ -4303,8 +4308,9 @@ int main(int argc, char** argv) {
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (st->cache.slot_of(l, e) >= 0) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
         if (!stage_pairs.empty()) lend_from = -1;   // the copy's budget goes to the hottest experts, not the loan
+        const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
-                                                    o.resident_headroom, o.resident_budget, &profile);
+                                                    o.resident_headroom, o.resident_budget, &rank_all);
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
             // #467: the whole complement does not fit - keep what does, the hottest by the profile, through the #403
@@ -4312,7 +4318,7 @@ int main(int argc, char** argv) {
             // the mmap fallback reads, so the answers are unchanged.  Nothing pinned: the old fallback below.
             whole_err = err;
             resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, -1, o.resident_headroom,
-                                                   strata::core::FileExpertSource::kResidentWhatFits, &profile);
+                                                   strata::core::FileExpertSource::kResidentWhatFits, &rank_all);
             if (resident_ok)
                 std::fprintf(stderr, "strata generate: WARNING: the whole resident RAM mode does not fit (%s); %.2f "
                                      "GiB of the experts the GPU does not hold, the hottest by the expert profile, are "
