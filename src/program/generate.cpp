@@ -3485,8 +3485,13 @@ int main(int argc, char** argv) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
-        // to hold back is the windows - and `free_b` has already lost the drafter.
-        const int64_t room = stage_room(st.dev, true, false);
+        // to hold back is the windows - and `free_b` has already lost the drafter.  Not the draft head and its
+        // logits: the drafter allocates them when it binds, after this, as on one GPU (#199), so on the last stage
+        // they come out of the cache here.  Out of the reserve instead, a later card without a display (300 MiB)
+        // had no room left for them: "mtp: the draft head does not fit" on two 16 GB cards.
+        const int64_t draft_head = (&st == last_st && !o.mtp.empty() && st.head.loaded())
+                                       ? (int64_t) mtp.bind_bytes(st.head.row_bytes(), n_vocab) : 0;
+        const int64_t room = stage_room(st.dev, true, false) - draft_head;
         const strata::core::OnDevice on(st.dev);
         std::vector<int64_t> sized;
         int64_t used = 0;
@@ -3524,9 +3529,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::fprintf(stderr, "strata generate: layer split: CUDA%d runs layers %lld-%lld, expert cache %lld slots "
-                             "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
+                             "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified%s\n",
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
-                     (long long) filled, st.profile.size());
+                     (long long) filled, st.profile.size(),
+                     draft_head > 0 ? (" (" + std::to_string(draft_head >> 20) + " MiB kept for the draft head)").c_str()
+                                    : "");
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
