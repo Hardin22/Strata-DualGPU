@@ -4,16 +4,17 @@ A fork of [Strata](https://github.com/Niko1221/Strata) for a PC with two NVIDIA 
 Qwen3.8-Flash-Next with it every day (the Swift 1.5 IQ2_XS fine-tune) behind a coding agent, on an RTX 5080 and an
 RTX 4060 Ti.
 
-Same PC, same model, same settings (256K context):
+Same PC, same model, same settings (256K context). Every row uses speculative decoding with a draft (MTP) layer:
+Strata's stock one, or the one I fine-tuned for this model ([below](#the-fine-tuned-draft-layer)).
 
 | | writes code | writes prose | reads a 32K prompt |
 |---|---:|---:|---:|
-| Strata 0.1.38 on the 5080 alone (what its setup picks for 32 GB) | 29 tok/s | 28 | 333 |
-| this fork on both cards | 143 tok/s | 102 | 1,940 |
-| this fork, with my fine-tuned draft head | 161 tok/s | 105 | 1,854 |
+| Strata 0.1.38 on the 5080 alone (what its setup picks for 32 GB), stock draft layer | 29 tok/s | 28 | 333 |
+| this fork on both cards, stock draft layer | 143 tok/s | 102 | 1,940 |
+| this fork on both cards, fine-tuned draft layer | 161 tok/s | 105 | 1,854 |
 
-With Pi, the coding agent I use, it peaks at 209 tokens/s, rarely drops under 100, and reads a 150K-token
-context at about 1,800 tokens/s. That is with the fine-tuned draft head, which is not in this repo yet.
+With Pi, the coding agent I use, and the fine-tuned draft layer, it peaks above 200 tokens/s (209 so far), rarely
+drops under 100, and reads a 150K-token context at about 1,800 tokens/s.
 
 ## Why a fork
 
@@ -54,6 +55,30 @@ Already using Strata? Unzip this next to it and run `START-HERE.bat`: Strata kee
 shared by every copy on the PC, so nothing is downloaded again. A model set up for one card asks once whether to use
 both. With `"layer_split": "auto"` in the config (the default), the server picks the card order and the VRAM
 reserves at every start.
+
+## The fine-tuned draft layer
+
+Strata guesses a few tokens ahead with a small draft (MTP) layer and has the model check them all at once. I
+fine-tuned that layer on the Swift 1.5 IQ2_XS model's own outputs, so more of its guesses get accepted, and gave it
+a draft vocabulary that covers every Latin-script token, so Italian, French or German text drafts as well as English
+and code. The model still checks every guess, so the answers don't change; only the speed does.
+
+It was trained for Swift 1.5 IQ2_XS. With another model it still gives correct answers, but it may be slower than
+the stock layer.
+
+1. Download `swift15-mtp-ft2.zip` from the [release](https://github.com/Hardin22/Strata-DualGPU/releases/latest).
+2. Unzip it into Strata's data folder, next to the stock layer. The stock one is in `Strata-data\mtp\rt`, so you
+   get `Strata-data\mtp\swift15-ft2`.
+3. Open your config (`strata-*.json` in the Strata folder) and change the path after `"--mtp"` to the new folder:
+
+   ```json
+   "--mtp", "C:\\path\\to\\Strata-data\\mtp\\swift15-ft2",
+   ```
+
+4. Restart Strata. The engine log (`strata-*.log`) should say `draft head over 143834 tokens`; the stock layer
+   says a smaller number.
+
+To go back, point `"--mtp"` at `mtp\rt` again. The zip has the Qwen and Swift licenses the layer is under.
 
 ## What I tested
 
