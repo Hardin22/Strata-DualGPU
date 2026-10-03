@@ -40,6 +40,13 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
+/// densefuse: pull device memory regions into L2 (prefetch.global.L2 per 128-byte line) - the next layer's weights
+/// while the GPU would otherwise wait for the CPU experts.  Reads nothing back; values are untouched.
+struct L2Regions { const void* p[16]; unsigned long long bytes[16]; int n; };
+void l2_prefetch(const L2Regions& r, int blocks, void* stream);
+/// densefuse: dst[r][0, w) = src[r][0, w) for `rows` rows of src stride `src_w` floats (the query half of each
+/// q/gate head pair) - the strided cudaMemcpy2DAsync as a kernel, so it stays on the compute queue.
+void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, int64_t src_w, void* stream);
 
 // ---- perf-review E-6: a layer whose routed experts are all in VRAM needs nothing from the host
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's

@@ -102,6 +102,11 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream);
 /// device memory with a kernel, so the handoff stays on the compute queue (a memcpy node is a copy-engine
 /// operation, which WDDM submits separately and which measured 67 flushes per token).
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
+/// densefuse: a layer split's hand-off for n_tok tokens in one launch.  Per token `hand` holds r floats of R, b of
+/// bo and i of inject, consecutive; R/bo/inj are n_tok contiguous rows of r/b/i floats.  `in`: hand-off -> device,
+/// else device -> hand-off.  Multiples of 4 floats, 16-byte aligned.
+void handoff_copy(float* R, float* bo, float* inj, float* hand, int64_t r, int64_t b, int64_t i, int n_tok, bool in,
+                  void* stream);
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 /// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).

@@ -47,6 +47,12 @@ void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, 
                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                        const KvHostPools* host = nullptr);
 
+/// densefuse: kv_append_q4_step for n tokens in one launch - token t's cell at step[t * kStepCount + kStepPos],
+/// K/V rows t * n_head_kv * 256 (the verify window's layout).  The same per-group quantization and stores.
+void kv_append_q4_step_multi(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                             const float* kcur, const float* vcur, int n, const QsaShapes& s, void* stream,
+                             const KvHostPools* host = nullptr);
+
 /// The prompt path: T consecutive (rotated) cells from pos0, K/V [T, n_head_kv, 256]; also into `stage` (identity
 /// layout, the one-layer staging pool of a streamed session) when given.
 void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,

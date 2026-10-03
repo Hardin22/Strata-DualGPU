@@ -30,6 +30,10 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // single-column call. Set before
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
+/// densefuse microbenchmark hook: 1 = the one-row-per-warp exact small-K layout, 0 = the 4-warp one, -1 = STRATA_DF_MMVQW.
+void native_mmvq_set_warp_rows(int on);
+/// densefuse microbenchmark hook: the grid-stride row-per-warp kernel with this many blocks per SM (0 off, -1 = STRATA_DF_MMVQGS).
+void native_mmvq_set_gs(int blocks_per_sm);
 bool native_mmvq_multi_exact();
 
 // One quantization may serve multiple weight matrices sharing the same input.
@@ -37,6 +41,9 @@ bool native_mmvq_multi_exact();
 // not reconstruct that sum from the quantized integers.
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
                           void* stream);
+/// densefuse: native_quantize_q8_1 of silu(gate) * up (the shared expert's SwiGLU, native_swiglu_kernel's
+/// expression) without writing the product: bitwise the two launches it replaces.
+void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream);
 
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);

@@ -115,6 +115,27 @@ __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restr
                  d, byte);
 }
 
+// densefuse: kv_append_q4_kernel for n verify tokens: blockIdx.z = 2 * token + (V ? 1 : 0)
+__global__ void kv_append_q4_multi_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
+                                          const int32_t* __restrict__ table, const int32_t* __restrict__ steps,
+                                          const float* __restrict__ kcur, const float* __restrict__ vcur,
+                                          int kv_heads, int head_dim, int page_size, KvHostPools host) {
+    const int tok = blockIdx.z >> 1;
+    const int32_t* step = steps + (size_t) tok * kStepCount;
+    const size_t row0 = (size_t) tok * kv_heads * head_dim;
+    const long long pos = (long long) __ldg(step + kStepPos);
+    const int h = blockIdx.x, b = blockIdx.y, t = threadIdx.x;
+    const bool is_v = (blockIdx.z & 1) == 1;
+    const float x = (is_v ? vcur : kcur)[row0 + h * head_dim + b * QK4_0 + t];
+    uint8_t byte;
+    const uint16_t d = q4_group(x, t, byte);
+    const long long page = (long long) table[pos / page_size];
+    if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, t, d, byte);
+    if (host.k_q4 != nullptr)
+        q4_store(is_v ? host.v_q4 : host.k_q4, ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size), b, t,
+                 d, byte);
+}
+
 // The prompt path: grid (T, kv_heads, groups), K then V; also into the staging pool (identity layout) when given.
 __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
                                           const int32_t* __restrict__ table, int64_t pos0,
@@ -199,6 +220,18 @@ void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, 
         k_q4, v_q4, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
         host ? *host : KvHostPools{});
     check("kv_append_q4 launch");
+}
+
+void kv_append_q4_step_multi(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                             const float* kcur, const float* vcur, int n, const QsaShapes& s, void* stream,
+                             const KvHostPools* host) {
+    if (n <= 0) return;
+    need_256(s, "kv_append_q4");
+    const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK4_0), (unsigned) (2 * n));
+    kv_append_q4_multi_kernel<<<grid, 32, 0, (cudaStream_t) stream>>>(
+        k_q4, v_q4, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
+        host ? *host : KvHostPools{});
+    check("kv_append_q4_multi launch");
 }
 
 void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,

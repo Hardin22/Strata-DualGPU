@@ -26,11 +26,13 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -140,9 +142,29 @@ __device__ __forceinline__ float warp_max(float x) {
 __launch_bounds__(QUANT_THREADS, 1)
 __global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
                                            Q81Block* __restrict__ y, int n_in) {
+    pdl_trigger();   // densefuse PDL: the projection after it may start loading its weights
+    pdl_wait();
     const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
     if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
     const float xi = x[i];
+    const float amax = warp_max(fabsf(xi));
+    const float sum = warp_sum(xi);
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    y[i / Q8K].qs[i % Q8K] = q;
+    if (i % Q8K == 0) y[i / Q8K].ds = make_half2(d, sum);
+}
+
+// densefuse: the shared expert's SwiGLU (native_swiglu_kernel's expression, explicit intrinsics) feeding this
+// quantization directly - the product never round-trips through memory, but it is the same float.
+__launch_bounds__(QUANT_THREADS, 1)
+__global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                                   Q81Block* __restrict__ y, int n_in) {
+    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
+    if (i >= n_in) return;
+    const float g = gate[i];
+    // __fmul_rn: the product is rounded on its own, as when it was stored, never contracted into the sums below
+    const float xi = __fmul_rn(__fdividef(g, 1.0f + __expf(-g)), up[i]);
     const float amax = warp_max(fabsf(xi));
     const float sum = warp_sum(xi);
     const float d = amax / 127.0f;
@@ -1007,7 +1029,32 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
     const int blocks_per_row = n_in / F::DIV;
     const int x_stride = n_in / Q8K;                   // Q8_1 blocks per activation column
     float tmp[NCOLS][ROWS] = {};
-    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += BPI) {
+    // densefuse PDL: the first block's weights are loaded (and decoded) before waiting for the activations
+    int kbx = tid / F::T;
+    {
+        typename F::W w0[ROWS];
+        const int kqs = F::kqs(tid);
+        if (kbx < blocks_per_row) {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i)
+                if (row0 + i < n_out) w0[i] = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+        }
+        pdl_trigger();
+        pdl_wait();
+        if (kbx < blocks_per_row) {
+            const int kby = kbx * F::KBY;
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j)
+                        tmp[j][i] += F::apply(w0[i], x + std::size_t(j) * x_stride + kby, kqs);
+                }
+            }
+        }
+        kbx += BPI;
+    }
+    for (; kbx < blocks_per_row; kbx += BPI) {
         const int kby = kbx * F::KBY;
         const int kqs = F::kqs(tid);
 #pragma unroll
@@ -1042,6 +1089,114 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
     }
 }
 
+// densefuse: the small-K exact layout with ONE ROW PER WARP.  The exact kernel above (4 warps, 4 rows) gives row r
+// the 128 partial dots of "virtual threads" tid = 32*w + l, each warp's partial starting from 0.0f, summed per lane
+// as ((p0 + p1) + p2) + p3 and then reduced across the lanes by the xor tree; tid >= 8 * blocks_per_row computes
+// nothing (37.5% of the threads at n_in 2560).  Here lane l of a warp computes the same four partials of its row in
+// the same order and adds them the same way, so every output is bitwise equal; the work is spread over all lanes
+// and needs no shared-memory reduction.
+template<typename F, int NCOLS>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_mmvq_multi_warp_kernel(const typename F::Block* __restrict__ w,
+                                              const Q81Block* __restrict__ x,
+                                              float* __restrict__ y, int n_in, int n_out) {
+    const int row = WARPS * int(blockIdx.x) + int(threadIdx.y);
+    const int lane = int(threadIdx.x);
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    pdl_trigger();
+    if (row >= n_out) { pdl_wait(); return; }
+    typename F::W wv[WARPS];
+    bool act[WARPS];
+#pragma unroll
+    for (int vw = 0; vw < WARPS; ++vw) {
+        const int tid = WARP * vw + lane;
+        const int kbx = tid / F::T;
+        act[vw] = kbx < blocks_per_row;
+        if (act[vw]) wv[vw] = F::load(w + std::size_t(row) * blocks_per_row + kbx, F::kqs(tid));
+    }
+    pdl_wait();
+    float v[NCOLS];
+#pragma unroll
+    for (int vw = 0; vw < WARPS; ++vw) {
+        const int tid = WARP * vw + lane;
+        const int kbx = tid / F::T;
+        const int kby = kbx * F::KBY;
+        const int kqs = F::kqs(tid);
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            float p = 0.0f;
+            if (act[vw]) p += F::apply(wv[vw], x + std::size_t(j) * x_stride + kby, kqs);
+            if (vw == 0) v[j] = p;
+            else v[j] += p;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        const float t = warp_sum(v[j]);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = t;
+    }
+}
+
+// densefuse: native_mmvq_multi_warp_kernel over a grid of resident blocks, each warp walking rows with a stride
+// and the next row's weights loaded while the current row is applied.  Per row the arithmetic is the row-per-warp
+// kernel's (bitwise the exact layout); fewer, longer-lived blocks keep more weight bytes in flight per SM.
+template<typename F, int NCOLS>
+__launch_bounds__(WARPS * WARP)
+__global__ void native_mmvq_multi_warp_gs_kernel(const typename F::Block* __restrict__ w,
+                                                 const Q81Block* __restrict__ x,
+                                                 float* __restrict__ y, int n_in, int n_out) {
+    const int lane = int(threadIdx.x);
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    const int stride = WARPS * int(gridDim.x);
+    int row = WARPS * int(blockIdx.x) + int(threadIdx.y);
+    typename F::W wv[WARPS];
+    bool act[WARPS];
+#pragma unroll
+    for (int vw = 0; vw < WARPS; ++vw) {
+        const int kbx = (WARP * vw + lane) / F::T;
+        act[vw] = kbx < blocks_per_row;
+        if (act[vw] && row < n_out) wv[vw] = F::load(w + std::size_t(row) * blocks_per_row + kbx, F::kqs(WARP * vw + lane));
+    }
+    pdl_trigger();
+    pdl_wait();
+    for (; row < n_out; row += stride) {
+        typename F::W wn[WARPS];
+        const int next = row + stride;
+#pragma unroll
+        for (int vw = 0; vw < WARPS; ++vw) {
+            const int kbx = (WARP * vw + lane) / F::T;
+            if (act[vw] && next < n_out) wn[vw] = F::load(w + std::size_t(next) * blocks_per_row + kbx, F::kqs(WARP * vw + lane));
+        }
+        float v[NCOLS];
+#pragma unroll
+        for (int vw = 0; vw < WARPS; ++vw) {
+            const int tid = WARP * vw + lane;
+            const int kbx = tid / F::T;
+            const int kby = kbx * F::KBY;
+            const int kqs = F::kqs(tid);
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                float p = 0.0f;
+                if (act[vw]) p += F::apply(wv[vw], x + std::size_t(j) * x_stride + kby, kqs);
+                if (vw == 0) v[j] = p;
+                else v[j] += p;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const float t = warp_sum(v[j]);
+            if (lane == 0) y[std::size_t(j) * n_out + row] = t;
+        }
+#pragma unroll
+        for (int vw = 0; vw < WARPS; ++vw) wv[vw] = wn[vw];
+    }
+}
+
+int g_mmvq_warp_override = -1;
+int g_mmvq_gs_override = -1;   // blocks per SM of the grid-stride kernel (0: off), -1: STRATA_DF_MMVQGS
+
 template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
@@ -1053,11 +1208,31 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         return;
     }
     const dim3 threads(WARP, WARPS);
-    if (n_in / F::DIV < F::BPI) {
+    // STRATA_DF_MMVQW: 0 = the 4-warp exact layout, 1 = row per warp always, unset/2 = row per warp from
+    // kWarpRowsMin output rows (cold, graph-timed: -10..-30% on 6144..248320-row IQ4_XS on both cards, slower at 640)
+    static const int warp_env = [] { const char* v = std::getenv("STRATA_DF_MMVQW"); return v ? std::atoi(v) : 2; }();
+    constexpr int kWarpRowsMin = 2048;
+    const int wmode = g_mmvq_warp_override >= 0 ? g_mmvq_warp_override : warp_env;
+    const bool warp_rows = wmode == 1 || (wmode == 2 && n_out >= kWarpRowsMin);
+    static const int gs_env = [] { const char* v = std::getenv("STRATA_DF_MMVQGS"); return v ? std::atoi(v) : 0; }();
+    const int gs = g_mmvq_gs_override >= 0 ? g_mmvq_gs_override : gs_env;
+    if (n_in / F::DIV < F::BPI && gs > 0) {
+        static int sms[64] = {};
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (dev >= 0 && dev < 64 && sms[dev] == 0) cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
+        const int sm = (dev >= 0 && dev < 64 && sms[dev] > 0) ? sms[dev] : 34;
+        const int need = (n_out + WARPS - 1) / WARPS;
+        const unsigned blocks = unsigned(need < gs * sm ? need : gs * sm);
+        launch_pdl(native_mmvq_multi_warp_gs_kernel<F, NCOLS>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out);
+    } else if (n_in / F::DIV < F::BPI && warp_rows) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        native_mmvq_multi_kernel<F, NCOLS, WARPS, WARPS><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
+        launch_pdl(native_mmvq_multi_warp_kernel<F, NCOLS>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out);
+    } else if (n_in / F::DIV < F::BPI) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, WARPS>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out);
     } else {
-        native_mmvq_multi_kernel<F, NCOLS, WARPS, 1><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out);
     }
 }
 
@@ -1142,6 +1317,8 @@ void small_f32(const void* weights, const float* x, void* scratch_q8_1,
 } // namespace
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
+void native_mmvq_set_warp_rows(int on) { g_mmvq_warp_override = on; }
+void native_mmvq_set_gs(int blocks_per_sm) { g_mmvq_gs_override = blocks_per_sm; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
@@ -1158,8 +1335,21 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     // ncols * n_in elements: every 32-element block stays inside one column.
     const int n_total = n_in * ncols;
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
-    native_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0,
-                                 static_cast<cudaStream_t>(stream)>>>(x, static_cast<Q81Block*>(x_q8_1), n_total);
+    launch_pdl(native_quantize_q8_1_kernel, dim3(blocks), dim3(QUANT_THREADS), 0, static_cast<cudaStream_t>(stream), x,
+               static_cast<Q81Block*>(x_q8_1), n_total);
+    launch_check();
+}
+
+void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    validate_pointer(gate);
+    validate_pointer(up);
+    validate_pointer(x_q8_1);
+    validate_stream(stream);
+    const int n_total = n_in * ncols;
+    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+    native_swiglu_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0, static_cast<cudaStream_t>(stream)>>>(
+        gate, up, static_cast<Q81Block*>(x_q8_1), n_total);
     launch_check();
 }
 

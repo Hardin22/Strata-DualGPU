@@ -34,5 +34,9 @@ void native_ple_postops(const float* projected_key, const float* hidden,
 /// channel) is advanced past the T tokens.
 void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
                               float* query_norm, float* gated, float* gate, int T, void* stream);
+/// densefuse: native_ple_postops_batch that also writes `snap` (T x 9 x 10240): the history after each token, as T
+/// single-token calls followed by a copy of the history would leave it (the verify window's commit snapshots).
+void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
+                                   float* query_norm, float* gated, float* gate, int T, float* snap, void* stream);
 
 } // namespace strata::kernels

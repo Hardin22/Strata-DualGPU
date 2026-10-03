@@ -302,6 +302,19 @@ private:
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
+
+    // densefuse: independent work of a layer captured as parallel graph branches (STRATA_DF_BRANCH, default on).
+    // The same kernels with the same inputs, so every value is unchanged; only their order on the GPU is freer.
+    bool branch_ = false;
+    cudaStream_t side_[2] = {};
+    cudaEvent_t ev_fork_ = nullptr;
+    cudaEvent_t ev_join_[2] = {};
+    // densefuse: L2 prefetch of the next layer's dense weights after this layer's VRAM experts (STRATA_DF_L2PF_MB,
+    // the per-layer budget; 0 = off), on its own branch joined at the window's end
+    int64_t l2pf_bytes_ = 0;
+    int l2pf_blocks_ = 0;
+    cudaStream_t side_pf_ = nullptr;
+    cudaEvent_t ev_pf_ = nullptr;
 };
 
 }  // namespace strata::core

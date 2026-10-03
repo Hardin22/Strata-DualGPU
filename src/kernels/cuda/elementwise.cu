@@ -275,8 +275,12 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
         std::fprintf(stderr, "copy_rows_from_mapped: width must be a multiple of 4 and both pointers 16-byte aligned\n");
         std::exit(1);
     }
-    copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
-                                                                                  width / 4, hit_rows, count);
+    // densefuse: one float4 per thread (a 2560-float row is 640 threads): every PCIe read of the row in flight at
+    // once instead of five dependent rounds of 128
+    const int64_t w4 = width / 4;
+    const unsigned threads = (unsigned) (w4 >= 1024 ? 1024 : ((w4 + 31) / 32) * 32);
+    copy_rows_from_mapped_kernel<<<(unsigned) rows, threads, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
+                                                                                      w4, hit_rows, count);
 }
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
@@ -288,6 +292,42 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
     copy_from_mapped_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src, n4);
     check_launch("copy_from_mapped");
+}
+
+// densefuse: a layer split's hand-off in ONE launch.  Per token the buffer holds R (r floats), bo (b floats) and
+// inject (i floats); `in` copies hand-off -> (R, bo, inj), otherwise (R, bo, inj) -> hand-off.  Plain copies.
+__global__ void handoff_copy_kernel(float4* R, float4* bo, float4* inj, volatile float4* hand, int r4, int b4, int i4,
+                                    int n_tok, int in) {
+    const int per = r4 + b4 + i4;
+    const int total = per * n_tok;
+    for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < total; k += gridDim.x * blockDim.x) {
+        const int t = k / per, j = k - t * per;
+        float4* dev = j < r4 ? R + (size_t) t * r4 + j
+                    : j < r4 + b4 ? bo + (size_t) t * b4 + (j - r4)
+                    : inj + (size_t) t * i4 + (j - r4 - b4);
+        if (in) {
+            *dev = const_cast<const float4*>(hand)[k];
+        } else {
+            const float4 v = *dev;
+            const_cast<float4*>(hand)[k] = v;
+        }
+    }
+}
+
+void handoff_copy(float* R, float* bo, float* inj, float* hand, int64_t r, int64_t b, int64_t i, int n_tok, bool in,
+                  void* stream) {
+    if (n_tok <= 0) return;
+    if ((r & 3) || (b & 3) || (i & 3) || ((uintptr_t) R & 15) || ((uintptr_t) bo & 15) || ((uintptr_t) inj & 15) ||
+        ((uintptr_t) hand & 15)) {
+        std::fprintf(stderr, "handoff_copy: sizes must be multiples of 4 floats and pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    const int64_t total = (r + b + i) / 4 * n_tok;
+    const int blocks = (int) ((total + 255) / 256 < 128 ? (total + 255) / 256 : 128);
+    handoff_copy_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) R, (float4*) bo, (float4*) inj,
+                                                                   (volatile float4*) hand, (int) (r / 4), (int) (b / 4),
+                                                                   (int) (i / 4), n_tok, in ? 1 : 0);
+    check_launch("handoff_copy");
 }
 
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
@@ -317,7 +357,9 @@ __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const vol
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
-    copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
+    // densefuse: up to 1024 threads, so a plan block (~500 words) crosses PCIe in one round, not four
+    const unsigned threads = (unsigned) (n >= 1024 ? 1024 : ((n + 31) / 32) * 32);
+    copy_i32_from_mapped_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
     check_launch("copy_i32_from_mapped");
 }
 
