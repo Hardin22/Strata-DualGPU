@@ -780,7 +780,8 @@ def gpu_list(cfg: dict) -> list[int]:
 
 # ---- a layer split's card order and VRAM reserves (the dual-GPU fork; docs/DUAL_GPU.md)
 SPLIT_RESERVE_DISPLAY_MIB = 1800    # a card that drives monitors: the desktop, a browser and the compositor grow on it
-SPLIT_RESERVE_HEADLESS_MIB = 300    # a card that drives none: nothing else allocates there
+SPLIT_RESERVE_HEADLESS_MIB = 512    # a card that drives none: only what the engine allocates after its caches (300
+                                    # left two RTX 5070 Ti on Linux without room for the second verifier)
 
 
 def split_order(speeds: dict, gpus: list) -> list:

@@ -126,7 +126,7 @@ slower one. It picks K=19 here: 158 tok/s on code against 165 for the hand-tuned
 
 ## 8. VRAM reserves
 
-When the config gives no reserve, the server reserves 1800 MiB on a card that drives a display and 300 MiB on one
+When the config gives no reserve, the server reserves 1800 MiB on a card that drives a display and 512 MiB on one
 that drives none. 1800 MiB is what two 4K monitors, a browser and the compositor needed here without the driver
 running out of VRAM. With one 1080p monitor you can go lower with `--vram-reserve-mib` (first card) and
 `--vram-reserve-later-mib` (the others). `"vram_reserve": "as_given"` in the config turns the automatic choice off.

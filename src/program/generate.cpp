@@ -1597,7 +1597,9 @@ int main(int argc, char** argv) {
     if (o.serve && o.pipeline_windows > 0 && !o.layer_split.empty() &&
         [] { const char* v = std::getenv("STRATA_PIPELINE_RESERVE"); return v == nullptr || std::atoi(v) != 0; }()) {
         o.vram_reserve_mib += o.pipeline_windows >= 2 ? 224 : 128;
-        if (o.vram_reserve_later_mib >= 0) o.vram_reserve_later_mib += 64;
+        // a later card's second verifier: its arena alone is 70-75 MiB, and its graphs come on top (64 MiB left two
+        // RTX 5070 Ti on Linux, the second without a monitor, short of it)
+        if (o.vram_reserve_later_mib >= 0) o.vram_reserve_later_mib += 160;
     }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
@@ -5022,10 +5024,15 @@ int main(int argc, char** argv) {
                 vs.n_slots = gs.cache.slots();
                 ok_b = gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err);
             }
-            ok_b = ok_b && ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err);
-            if (!ok_b) {
-                std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifiers: %s (raise --vram-reserve-mib "
-                                     "by ~120 on the first card and ~60 on the second)\n", err.c_str());
+            if (!ok_b) {   // the later card: its reserve is --vram-reserve-later-mib, not --vram-reserve-mib
+                std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA%d (the later card): %s "
+                                     "(raise --vram-reserve-later-mib by ~200, or --pipeline-windows 0)\n", gs.dev,
+                             err.c_str());
+                return 1;
+            }
+            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+                std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA0 (the first card): %s "
+                                     "(raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
                 return 1;
             }
             split_drive_b = split_drive;
