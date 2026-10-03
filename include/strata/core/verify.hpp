@@ -114,6 +114,17 @@ public:
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    /// TRIMS (layer split): the cross-stage flag, a word of mapped PORTABLE memory per boundary.  The stage that hands
+    /// off raises `out` once its hand-off is visible (one kernel writes the hand-off and then the flag); the next
+    /// stage's graph waits for `in` on its own device before it reads the hand-off.  With both set, `run` launches
+    /// every stage's graph at once and serves them in order: no host wait, staging or launch between the stages
+    /// (STRATA_XSTAGE=0: the old order, each stage launched once the previous one is synchronized).  Before `init`.
+    void set_stage_flags(uint32_t* in_flag, uint32_t* out_flag) { xin_ = in_flag; xout_ = out_flag; }
+    /// TRIMS: `commit` without waiting for the GPU - every stage's commit graph is queued on its stream, where the
+    /// next window's graph follows it anyway.  `commit_wait` waits for all of them (before anything outside the
+    /// verify windows touches the session: the prompt path, checkpoints, the state hash).
+    bool commit_async(int n_keep, std::string& err);
+    bool commit_wait(std::string& err);
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -158,6 +169,10 @@ public:
     bool no_pcie() const { return no_pcie_; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    /// host time per stage beyond the per-layer loop: the graph launch, the wait for the graph's end (and the copy
+    /// stream), what follows it (profile readback, host-side sampling, hand-over to the next stage)
+    double ms_launch = 0, ms_sync = 0, ms_post = 0;
+    double ms_ple = 0;   ///< trims (late PLE rows): the host's wait for the rows after layer 0
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
@@ -165,6 +180,24 @@ public:
 
 private:
     bool capture(int T, std::string& err);
+    // `run`, in four steps (a layer split runs them stage by stage, or all prepares/launches first: set_stage_flags)
+    bool prepare(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    bool launch(std::string& err);
+    bool serve(PoolMultiFn pool, void* user, std::string& err);
+    bool finish(int32_t* out, std::string& err);
+    void release_window();   // an error before this stage was served: let its launched graph run to its end
+    bool run_chain(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                   std::string& err);
+    // TRIMS (STRATA_PLE_LATE, default on): the PLE rows are read from the SSD while the GPU runs the embedding and
+    // layer 0; the host hands them over after serving layer 0 and raises this flag, which the graph waits for just
+    // before layer 1's PLE block (the old order read them before the launch).  The same rows, bit for bit.
+    bool ple_late_ = false;
+    bool ple_issued_ = false;
+    uint32_t* h_pleflag_ = nullptr;
+    uint32_t* m_pleflag_ = nullptr;
+    uint32_t* xin_ = nullptr;             // set_stage_flags (mapped portable: host and device alias)
+    uint32_t* xout_ = nullptr;
+    unsigned int* xcount_ = nullptr;      // handoff_publish's block counter (device)
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;
@@ -195,6 +228,7 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    double prof_span_ = 0;   // the stage's first stamp to its last, summed (ns)
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

@@ -461,12 +461,19 @@ public:
     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
     int64_t commit_exchanges();
-    /// `commit_exchanges` in two halves, for the asynchronous adaptive tier: `commit_copies` moves every staged
-    /// evicted blob into its `in`'s place in the copy (safe on another thread once nothing computes `in` from RAM -
-    /// it is resident - and while `out` is still read from its exchange buffer), then `commit_flip` (the caller's
-    /// thread, between windows) points `out` there and drops the staging.  Returns how many were applied.
-    void commit_copies();
-    int64_t commit_flip();
+    /// TRIMS: `commit_exchanges` in two halves.  `commit_exchanges_copy` only writes each `out` blob into `in`'s place
+    /// in RAM (the ~1.4 MB memcpy per swap that is the whole cost); it may run on another thread while verify windows
+    /// run, provided every staged `in` is already resident on its GPU (nothing reads `in`'s place then) - `out` is
+    /// still read from its exchange buffer, which the copy only reads.  `commit_exchanges_finish` then swaps the
+    /// residency and frees the buffers, between windows.  Together: exactly `commit_exchanges`.
+    /// `gate` (optional): the copy pauses while it reads true - the CPU expert pool is running, and this copy
+    /// would take RAM bandwidth from it - and goes on in 256 KiB pieces otherwise.
+    void commit_exchanges_copy(const std::atomic<bool>* gate = nullptr);
+    int64_t commit_exchanges_finish();
+    bool exchanges_staged() const { return !staged_.empty(); }
+    /// misspath's names for the same two halves (its asynchronous adaptive tier)
+    void commit_copies(const std::atomic<bool>* gate = nullptr) { commit_exchanges_copy(gate); }
+    int64_t commit_flip() { return commit_exchanges_finish(); }
     /// The compact copy's blob of `(layer, expert)` or null; does not count as a read (any thread).
     const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
     int64_t exchanges() const { return exchanges_; }

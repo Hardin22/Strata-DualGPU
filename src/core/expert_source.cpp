@@ -1671,25 +1671,32 @@ int64_t FileExpertSource::commit_exchanges() {
     return n;
 }
 
-void FileExpertSource::commit_copies() {
+void FileExpertSource::commit_exchanges_copy(const std::atomic<bool>* gate) {
+    constexpr size_t kPiece = 256 * 1024;
     for (const Exchange& x : staged_) {
         const uint8_t* src = override_.empty() ? nullptr : override_[x.out];
         const uint64_t at = complement_offsets_[x.in];
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-            complement_host_ != nullptr)
-            std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+            complement_host_ != nullptr) {
+            uint8_t* dst = (uint8_t*) complement_host_ + (size_t) at;
+            for (size_t o = 0; o < (size_t) x.bytes; o += kPiece) {
+                if (gate != nullptr)
+                    while (gate->load(std::memory_order_relaxed)) std::this_thread::yield();
+                std::memcpy(dst + o, src + o, std::min(kPiece, (size_t) x.bytes - o));
+            }
+        }
     }
 }
 
-int64_t FileExpertSource::commit_flip() {
+int64_t FileExpertSource::commit_exchanges_finish() {
     int64_t n = 0;
     for (const Exchange& x : staged_) {
-        const uint8_t* src = override_[x.out];
+        const uint8_t* src = override_.empty() ? nullptr : override_[x.out];
         const uint64_t at = complement_offsets_[x.in];
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr && detail::exchange_cache_complement(complement_offsets_, x.in, x.out))
             ++n;
-        override_[x.out] = nullptr;
+        if (!override_.empty()) override_[x.out] = nullptr;
     }
     staged_.clear();
     exchanges_ += n;

@@ -556,4 +556,87 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
 
+
+// ---- trims: the layer split's hand-off as one kernel each way, and the cross-stage flag
+//
+// handoff_publish: per token t, hand_out[t*HB + (0, HCN, HCN+N)] = R[t] | bo[t] | inj2[t] (the earlier copy kernels'
+// bytes, in one launch) and then *flag = 1: every block fences its stores system-wide before it counts itself done,
+// and the last block raises the flag, so a reader that sees the flag sees the hand-off (the next stage's graph waits
+// for it on its own device, wait_flag_ge).  `counter` (device) is back at 0 when the kernel ends.
+namespace {
+__global__ void handoff_publish_kernel(const float4* __restrict__ R, const float4* __restrict__ bo,
+                                       const float4* __restrict__ inj, int T, int hcn4, int n4, int hc4,
+                                       float4* hand, int hb4, uint32_t* flag, unsigned int* counter) {
+    const int per = hcn4 + n4 + hc4;
+    const int total = T * per;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
+        const int t = i / per, w = i - t * per;
+        float4 v;
+        if (w < hcn4) v = R[(size_t) t * hcn4 + w];
+        else if (w < hcn4 + n4) v = bo[(size_t) t * n4 + (w - hcn4)];
+        else v = inj[(size_t) t * hc4 + (w - hcn4 - n4)];
+        hand[(size_t) t * hb4 + w] = v;   // fenced below, before the flag
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int prev = atomicAdd(counter, 1u);
+        if (prev == gridDim.x - 1) {
+            *counter = 0u;
+            __threadfence_system();
+            *(volatile uint32_t*) flag = 1u;
+            __threadfence_system();
+        }
+    }
+}
+__global__ void handoff_take_kernel(const float4* hand, int hb4, int T, int hcn4, int n4, int hc4, float4* __restrict__ R,
+                                    float4* __restrict__ bo, float4* __restrict__ inj) {
+    const int per = hcn4 + n4 + hc4;
+    const int total = T * per;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
+        const int t = i / per, w = i - t * per;
+        const float4 v = __ldcv(hand + (size_t) t * hb4 + w);   // mapped memory another GPU wrote: no cached copy
+        if (w < hcn4) R[(size_t) t * hcn4 + w] = v;
+        else if (w < hcn4 + n4) bo[(size_t) t * n4 + (w - hcn4)] = v;
+        else inj[(size_t) t * hc4 + (w - hcn4 - n4)] = v;
+    }
+}
+}  // namespace
+
+void handoff_publish(const float* R, const float* bo, const float* inj2, int T, int64_t hcn, int64_t n, int64_t hc,
+                     float* hand_out, int64_t hb, uint32_t* flag, unsigned int* counter, void* stream) {
+    if ((hcn | n | hc | hb) & 3) { std::fprintf(stderr, "handoff_publish: sizes must be multiples of 4\n"); std::exit(1); }
+    handoff_publish_kernel<<<32, 256, 0, (cudaStream_t) stream>>>((const float4*) R, (const float4*) bo,
+                                                                 (const float4*) inj2, T, (int) (hcn / 4), (int) (n / 4),
+                                                                 (int) (hc / 4), (float4*) hand_out, (int) (hb / 4), flag,
+                                                                 counter);
+    check("handoff_publish");
+}
+
+void handoff_take(const float* hand_in, int64_t hb, int T, int64_t hcn, int64_t n, int64_t hc, float* R, float* bo,
+                  float* inj2, void* stream) {
+    if ((hcn | n | hc | hb) & 3) { std::fprintf(stderr, "handoff_take: sizes must be multiples of 4\n"); std::exit(1); }
+    handoff_take_kernel<<<64, 256, 0, (cudaStream_t) stream>>>((const float4*) hand_in, (int) (hb / 4), T, (int) (hcn / 4),
+                                                              (int) (n / 4), (int) (hc / 4), (float4*) R, (float4*) bo,
+                                                              (float4*) inj2);
+    check("handoff_take");
+}
+
+// ---- trims: the MTP draft chain in one graph - draft j runs only while every earlier draft's probability is at
+// least the request's min_p (read from mapped memory, written by the host before the launch): the host loop's own rule
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+namespace {
+__global__ void mtp_chain_gate_kernel(cudaGraphConditionalHandle h, const float* probs, int j, const float* min_p) {
+    const float mp = *(const volatile float*) min_p;
+    unsigned int go = 1;
+    for (int i = 0; i < j; ++i) go &= ((const volatile float*) probs)[i] >= mp ? 1u : 0u;
+    cudaGraphSetConditional(h, go);
+}
+}  // namespace
+void mtp_chain_gate(unsigned long long handle, const float* probs, int j, const float* min_p, void* stream) {
+    mtp_chain_gate_kernel<<<1, 1, 0, (cudaStream_t) stream>>>((cudaGraphConditionalHandle) handle, probs, j, min_p);
+    check("mtp_chain_gate");
+}
+#endif
+
 }  // namespace strata::kernels

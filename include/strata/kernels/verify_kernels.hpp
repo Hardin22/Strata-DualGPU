@@ -73,6 +73,19 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
 /// ptr[k] = base + k * blob_bytes for k < *n (the staged copies `fetch_blobs` made).
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream);
 
+// ---- trims: the layer split's hand-off (src/core/verify.cpp)
+/// hand_out[t*hb + (0 | hcn | hcn+n)] = R[t] | bo[t] | inj2[t] for t < T (mapped memory), then *flag = 1 once every
+/// store is visible system-wide (the next stage's graph, on another GPU, waits for it).  `counter`: device scratch
+/// (one unsigned, zero; left zero).  All sizes multiples of 4, pointers 16-byte aligned.
+void handoff_publish(const float* R, const float* bo, const float* inj2, int T, int64_t hcn, int64_t n, int64_t hc,
+                     float* hand_out, int64_t hb, uint32_t* flag, unsigned int* counter, void* stream);
+/// The reverse, from the mapped hand-off into the stage's R / bo / inj2 (uncached loads).
+void handoff_take(const float* hand_in, int64_t hb, int T, int64_t hcn, int64_t n, int64_t hc, float* R, float* bo,
+                  float* inj2, void* stream);
+/// The MTP chain in one graph: sets the conditional `handle` to 1 when probs[0, j) are all >= *min_p (both read
+/// from mapped memory), else 0.  CUDA only (conditional graph nodes).
+void mtp_chain_gate(unsigned long long handle, const float* probs, int j, const float* min_p, void* stream);
+
 // ---- the MTP draft layer (src/core/mtp.cpp)
 /// R[t][c][:] = h[t][c][:] + e[t][:]  (the embedding branch added to every stream).
 void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_embd, int hc, int n_tok, void* stream);

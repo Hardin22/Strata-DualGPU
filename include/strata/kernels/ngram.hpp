@@ -147,6 +147,11 @@ public:
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// TRIMS: `gather_batch` in two halves - the reads start at `gather_issue` (Direct mode; the mapped mode does it
+    /// all in `gather_collect`) and `gather_collect` waits for them and writes `out`.  One batch in flight; not while
+    /// a single-token `issue` is pending.  The same bytes as `gather_batch`.
+    bool gather_issue(const uint32_t* rows, size_t n_tokens, std::string& err);
+    bool gather_collect(float* out, std::string& err);
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

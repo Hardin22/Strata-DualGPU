@@ -776,15 +776,66 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
     }
 }
 
+// STRATA_WINDOW_TRACE=<file> (debug): one line per verify window with its tokens, picks, drafts and hashes of what
+// crossed between the GPU and the CPU pool (the routed activations in, the CPU expert rows out) and of the final
+// residual - two runs of the same requests compared line by line show where they first part (nondeterminism hunt).
+struct WinTrace {
+    std::FILE* f = nullptr;
+    uint64_t hin = 0, hout = 0;   // this window's pool inputs / outputs, chained over its layers
+    uint32_t lin[64] = {}, lout[64] = {};   // per layer (truncated)
+};
+WinTrace& win_trace() {
+    static WinTrace t = [] {
+        WinTrace w;
+        if (const char* path = std::getenv("STRATA_WINDOW_TRACE")) {
+            w.f = std::fopen(path, "a");
+#if defined(_WIN32)
+            if (w.f) std::fprintf(w.f, "# engine pid %lu\n", (unsigned long) GetCurrentProcessId());
+#endif
+        }
+        return w;
+    }();
+    return t;
+}
+uint64_t trace_hash(const void* data, size_t n, uint64_t h) {
+    const uint8_t* b = (const uint8_t*) data;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        std::memcpy(&w, b + i, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+// TRIMS: true while a verify window's CPU expert pool runs (drive_pool_multi).  The adaptive tier's background copies
+// (pageable refills, the RAM side of the exchanges) wait while it is set, so they take RAM bandwidth only while the
+// host waits for the GPU - most of a window - and not from the pool, which is bound by it.
+std::atomic<bool> g_pool_active{false};
+
 /// Plan v0.3 P6: the pool for a verify window.
 void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                       int64_t layer) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
+    g_pool_active.store(true, std::memory_order_relaxed);
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
+    g_pool_active.store(false, std::memory_order_relaxed);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
+    if (WinTrace& wt = win_trace(); wt.f != nullptr) {
+        const size_t H = (size_t) strata::kernels::cpu::H;
+        wt.hin = trace_hash(x_f, (size_t) n_tok * H * sizeof(float), wt.hin);
+        wt.hin = trace_hash(ids, (size_t) (n_tok * k) * sizeof(int32_t), wt.hin);
+        wt.hout = trace_hash(out, (size_t) (n_tok * k) * H * sizeof(float), wt.hout);
+        if (layer >= 0 && layer < 64) {
+            wt.lin[layer] = (uint32_t) trace_hash(x_f, (size_t) n_tok * H * sizeof(float), 1);
+            wt.lout[layer] = (uint32_t) trace_hash(out, (size_t) (n_tok * k) * H * sizeof(float), 1);
+        }
+    }
     // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
     // one record per token.  The multi dispatch fuses the router weights into the kernel and does not surface
     // them, so records carry unit weights: tools/make_profile.py ranks pairs by routed frequency, which is the
@@ -4597,11 +4648,32 @@ int main(int argc, char** argv) {
                 }
                 std::memset(hh, 0, hb);
             }
+            // trims: one flag word per boundary (mapped, portable): the stage that hands off raises it, the next
+            // stage's graph waits for it on its own device - every stage's graph is launched at once (see
+            // Verifier::set_stage_flags).  STRATA_XSTAGE=0: the host synchronizes each stage before the next.
+            static const bool xstage = [] { const char* v = std::getenv("STRATA_XSTAGE"); return v == nullptr || std::atoi(v) != 0; }();
+            std::vector<uint32_t*> xflag((size_t) n_stages - 1, nullptr);
+            for (uint32_t*& f : xflag) {
+                if (!xstage) break;
+                uint32_t* hf = nullptr;
+                uint32_t* df = nullptr;
+                if (cudaHostAlloc((void**) &hf, 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &df, hf, 0) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the layer-split flag allocation failed\n");
+                    return 1;
+                }
+                std::memset(hf, 0, 64);
+                f = df == hf ? df : nullptr;   // the host writes it through the same address (unified addressing)
+            }
+            for (uint32_t* f : xflag)
+                if (f == nullptr) { for (uint32_t*& g2 : xflag) g2 = nullptr; break; }
             split_drive.base = &drive;
             split_drive.n = n_stages;
             for (int st = 0; st < n_stages; ++st) {
                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
                                         st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                stage_ver(st).set_stage_flags(st == 0 ? nullptr : xflag[(size_t) st - 1],
+                                              st + 1 < n_stages ? xflag[(size_t) st] : nullptr);
                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
@@ -4923,9 +4995,13 @@ int main(int argc, char** argv) {
             pending.clear();
             res_upload();
         };
+        // STRATA_DECODE_TIMING: what the adaptive tier costs (its thread runs beside the commit and the draft)
+        double ad_ms_choose = 0, ad_ms_back = 0, ad_ms_queue = 0;
+        int64_t ad_rounds = 0, ad_swaps = 0;
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            const Clock::time_point ad0 = Clock::now();
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -4950,6 +5026,7 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            const Clock::time_point ad1 = Clock::now();
             // the copies back read the cache of the card that owns each layer (see resident_stage_swaps)
             auto home_of = [&](int64_t layer) -> SwapHome {
                 const int stn = multi_gpu ? stage_of(layer) : 0;
@@ -4965,6 +5042,7 @@ int main(int argc, char** argv) {
                              cudaGetErrorString(e));
                 return false;
             }
+            const Clock::time_point ad2 = Clock::now();
             bool main_live = false;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
@@ -5012,6 +5090,12 @@ int main(int argc, char** argv) {
                 }
             }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
+            const Clock::time_point ad3 = Clock::now();
+            ad_ms_choose += std::chrono::duration<double, std::milli>(ad1 - ad0).count();
+            ad_ms_back += std::chrono::duration<double, std::milli>(ad2 - ad1).count();
+            ad_ms_queue += std::chrono::duration<double, std::milli>(ad3 - ad2).count();
+            ++ad_rounds;
+            ad_swaps += (int64_t) swaps.size();
             return true;
         };
         // #477: write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).
@@ -5058,6 +5142,9 @@ int main(int argc, char** argv) {
         std::atomic<bool> a_err{false};
         std::vector<AHome> ahomes;     // [0] = CUDA0's cache, [1..] = the later stages'
         std::unique_ptr<JobThread> ajob;
+        // STRATA_ADAPT_GATE (default on): the tier's host-side copies wait while the CPU pool runs (g_pool_active),
+        // so they take RAM bandwidth while the host waits for the GPU and not from the pool, which is bound by it
+        static const bool ad_gate = [] { const char* v = std::getenv("STRATA_ADAPT_GATE"); return v == nullptr || std::atoi(v) != 0; }();
         // policy knobs of the asynchronous tier (defaults = the blocking tier's rule): STRATA_ADAPT_MIN (a candidate's
         // decayed count), STRATA_ADAPT_MARGIN (over its victim's), STRATA_ADAPT_DECAY (per round), STRATA_ADAPT_W1 (gain
         // weight of the later stages' layers: their misses stall the faster card), STRATA_ADAPT_CAP (swaps per round,
@@ -5141,6 +5228,8 @@ int main(int argc, char** argv) {
                 const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer);
                 const uint8_t* b = src.resident_blob(w.layer, w.in);
                 if (b == nullptr) { a_err = true; continue; }
+                if (ad_gate)   // trims: the bounce memcpy (or the driver's staging) not beside the CPU pool
+                    while (g_pool_active.load(std::memory_order_relaxed)) std::this_thread::yield();
                 if (!src.pinned(w.layer, w.in) && a_bounce >= 0) {   // a pinned bounce buffer: an async copy, not a staged one
                     uint8_t* bb = src.exchange_buffer(a_bounce + w.q);
                     std::memcpy(bb, b, nb);
@@ -5208,7 +5297,7 @@ int main(int argc, char** argv) {
                     for (const ASwap& w : aswaps) host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
                     a_dirty = true;
                     if (a_e6) { res_upload(); a_dirty = false; }
-                    ajob->post([&] { src.commit_copies(); });
+                    ajob->post([&] { src.commit_copies(ad_gate ? &g_pool_active : nullptr); });
                     astate = AState::Commit;
                     if (!drain) return true;
                     continue;
@@ -6060,6 +6149,22 @@ int main(int argc, char** argv) {
             };
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
+            // the rest of the window (STRATA_DECODE_TIMING's second line): before the run, around the commit, after
+            // the draft, and the time between two windows
+            double dt_pre = 0, dt_apply = 0, dt_pen = 0, dt_c = 0, dt_emit = 0, dt_join = 0, dt_post = 0;
+            auto vsnap = [&](int st, double* o) {
+                strata::core::Verifier& v = stage_ver(st);
+                o[0] = v.ms_wait; o[1] = v.ms_pool; o[2] = v.ms_host; o[3] = v.ms_launch; o[4] = v.ms_sync;
+                o[5] = v.ms_post; o[6] = v.ms_commit; o[7] = v.ms_ple;
+            };
+            double vs0[2][8] = {};
+            for (int st = 0; st < std::min(n_stages, 2); ++st) vsnap(st, vs0[st]);
+            const double ad0_choose = ad_ms_choose, ad0_back = ad_ms_back, ad0_queue = ad_ms_queue;
+            const int64_t ad0_rounds = ad_rounds, ad0_swaps = ad_swaps;
+            Clock::time_point prev_end{};
+            bool have_prev_end = false;
+            static const bool commit_async = [] { const char* v = std::getenv("STRATA_COMMIT_ASYNC"); return v == nullptr || std::atoi(v) != 0; }();
+            static const bool mtp_early = [] { const char* v = std::getenv("STRATA_MTP_EARLY"); return v == nullptr || std::atoi(v) != 0; }();
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
@@ -6068,6 +6173,8 @@ int main(int argc, char** argv) {
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
+                const Clock::time_point tl0 = Clock::now();
+                if (have_prev_end) dt_post += std::chrono::duration<double, std::milli>(tl0 - prev_end).count();
                 int T = S_mtp;
                 if (req_spec_min_p > 0.0) {
                     T = 1;
@@ -6094,6 +6201,7 @@ int main(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
+                const Clock::time_point tl1 = Clock::now();
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
@@ -6102,6 +6210,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
                 }
+                const Clock::time_point tl2 = Clock::now();
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
@@ -6115,6 +6224,10 @@ int main(int argc, char** argv) {
                 }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
+                {
+                    auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+                    dt_pre += msd(tl0, tl1); dt_apply += msd(tl1, tl2); dt_pen += msd(tl2, tw0);
+                }
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -6125,18 +6238,41 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
+                // the asynchronous tier (ajob, --adapt-async 1) replaces the blocking round
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
+                // trims: the commits are queued on each stage's stream (the next window's graph follows them there)
+                // and run beside the emit and the draft; STRATA_COMMIT_ASYNC=0 waits for each as before
+                if (!(commit_async ? ver.commit_async(a + 1, err) : ver.commit(a + 1, err))) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                const Clock::time_point tw1c = Clock::now();
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
                 draft_accepted += a;
                 first_window = false;
+                // trims (STRATA_MTP_EARLY, default on): the draft round is launched before the tokens are emitted
+                // (the emit loop below decides whether a round follows; the same rule, evaluated first)
+                bool draft_early = false;
+                if (mtp_early && !(hist_n > 0 && mtp.coupled())) {
+                    bool eos_pre = false;
+                    int64_t prod_pre = produced_n;
+                    for (int i = 0; i <= a && prod_pre < max_new && !eos_pre; ++i) {
+                        ++prod_pre;
+                        eos_pre = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                    }
+                    if (!eos_pre && prod_pre < max_new) {
+                        if (!mtp.draft_begin(T, outv.data(), p, a, (float) req_spec_min_p, err)) {
+                            if (adapt_thr.joinable()) adapt_thr.join();
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        draft_early = true;
+                    }
+                }
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
@@ -6152,15 +6288,47 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                const bool drafted = eos || produced_n >= max_new ||
+                const bool drafted = draft_early ? mtp.draft_end(drafts.data(), dprob.data(), nullptr, err)
+                                                 : eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+                    dt_c += msd(tw1, tw1c); dt_emit += msd(tw1c, tw2);
                     ++dec_windows; dec_T += T;
                 }
+                if (WinTrace& wtr = win_trace(); wtr.f != nullptr) {
+                    // the final residual of the window's rows (last stage), hashed on the host
+                    const int64_t HCN = (int64_t) g.hc * g.n_embd;
+                    std::vector<float> rr((size_t) (T * HCN));
+                    {
+                        const strata::core::OnDevice on_r(last_st ? last_st->dev : -1);
+                        cudaDeviceSynchronize();
+                        cudaMemcpy(rr.data(), ver.final_R_all(), rr.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                    }
+                    std::fprintf(wtr.f, "req %lld p %lld T %d sfx %d a %d win", (long long) n, (long long) p, T, (int) from_sfx, a);
+                    for (int i = 0; i < T; ++i) std::fprintf(wtr.f, " %d", window[(size_t) i]);
+                    std::fprintf(wtr.f, " out");
+                    for (int i = 0; i < T; ++i) std::fprintf(wtr.f, " %d", outv[(size_t) i]);
+                    std::fprintf(wtr.f, " in %016llx cpu %016llx R %016llx draft", (unsigned long long) wtr.hin,
+                                 (unsigned long long) wtr.hout,
+                                 (unsigned long long) trace_hash(rr.data(), rr.size() * sizeof(float), 1469598103934665603ull));
+                    for (int i = 0; i < S - 1; ++i) {
+                        uint32_t pb = 0;
+                        std::memcpy(&pb, &dprob[(size_t) i], 4);
+                        std::fprintf(wtr.f, " %d:%08x", drafts[(size_t) i], pb);
+                    }
+                    std::fprintf(wtr.f, " L");
+                    for (int64_t l = 0; l < g.n_layers && l < 64; ++l)
+                        std::fprintf(wtr.f, " %08x:%08x", wtr.lin[l], wtr.lout[l]);
+                    std::fprintf(wtr.f, "\n");
+                    std::fflush(wtr.f);
+                    wtr.hin = wtr.hout = 0;
+                }
+                const Clock::time_point tj0 = Clock::now();
                 if (adapt_thr.joinable()) adapt_thr.join();
+                dt_join += std::chrono::duration<double, std::milli>(Clock::now() - tj0).count();
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
@@ -6176,6 +6344,13 @@ int main(int argc, char** argv) {
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
+                prev_end = Clock::now();
+                have_prev_end = true;
+            }
+            // the last window's commits are queued: done before anything else touches the session
+            if (commit_async && !ver.commit_wait(err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
@@ -6195,6 +6370,25 @@ int main(int argc, char** argv) {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                {
+                    double vs1[2][8] = {};
+                    for (int st = 0; st < std::min(n_stages, 2); ++st) vsnap(st, vs1[st]);
+                    auto dv = [&](int st, int i) { return st < n_stages ? (vs1[st][i] - vs0[st][i]) / w : 0.0; };
+                    const double accounted = dt_pre + dt_apply + dt_pen + dt_run + dt_c + dt_emit + dt_draft + dt_join + dt_post;
+                    const double ar = (double) (ad_rounds - ad0_rounds);
+                    std::fprintf(stderr, "strata decode host (ms/window): pre %.3f apply %.3f pen %.3f run %.3f commit %.3f "
+                                         "emit %.3f draft %.3f adapt-join %.3f between %.3f unaccounted %.3f | stage 0: "
+                                         "staging %.3f launch %.3f reach %.3f pool %.3f ple %.3f sync %.3f post %.3f commit %.3f | "
+                                         "stage 1: staging %.3f launch %.3f reach %.3f pool %.3f sync %.3f post %.3f commit %.3f"
+                                         " | adapt: %lld rounds, %.1f swaps/round, choose %.2f copy-back %.2f queue %.2f ms/round\n",
+                                 dt_pre / w, dt_apply / w, dt_pen / w, dt_run / w, dt_c / w, dt_emit / w, dt_draft / w,
+                                 dt_join / w, dt_post / w, (decode_ms - accounted) / w,
+                                 dv(0, 2), dv(0, 3), dv(0, 0), dv(0, 1), dv(0, 7), dv(0, 4), dv(0, 5), dv(0, 6),
+                                 dv(1, 2), dv(1, 3), dv(1, 0), dv(1, 1), dv(1, 4), dv(1, 5), dv(1, 6),
+                                 (long long) ar, ar > 0 ? (double) (ad_swaps - ad0_swaps) / ar : 0.0,
+                                 ar > 0 ? (ad_ms_choose - ad0_choose) / ar : 0.0, ar > 0 ? (ad_ms_back - ad0_back) / ar : 0.0,
+                                 ar > 0 ? (ad_ms_queue - ad0_queue) / ar : 0.0);
+                }
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (!pr.empty())
