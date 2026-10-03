@@ -5666,6 +5666,9 @@ int main(int argc, char** argv) {
                     ++a_rounds;
                     a_usage = drive.d.usage;
                     a_res = host_res;
+                    // #477 --expert-profile-save: the routing counted, as the blocking tier counts it (without this
+                    // the async tier saved the residency and the loaded order only)
+                    for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
                     for (float& v : drive.d.usage) v *= a_decay;
                     ajob->post(a_choose);
                     astate = AState::CopyBack;
