@@ -1,6 +1,6 @@
 # Something went wrong?
 
-The common problems and what to do. Back to the [README](../README.md#something-went-wrong). The full table of
+The common problems and what to do. Back to the [README](../README.upstream.md#something-went-wrong). The full table of
 error messages, with the older engine fixes, is in the [details](DETAILS.md#troubleshooting).
 
 ## While installing or starting
