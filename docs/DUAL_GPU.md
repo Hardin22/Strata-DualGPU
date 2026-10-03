@@ -131,6 +131,32 @@ that drives none. 1800 MiB is what two 4K monitors, a browser and the compositor
 running out of VRAM. With one 1080p monitor you can go lower with `--vram-reserve-mib` (first card) and
 `--vram-reserve-later-mib` (the others). `"vram_reserve": "as_given"` in the config turns the automatic choice off.
 
+## 9. Each card keeps only its own layers' weights
+
+A split used to load the dense weights of all 48 layers on every card, although each card runs only its own layers.
+Now each card keeps the weights of its layers, and the VRAM this frees goes to its expert cache. Upstream has the same
+idea in two open pull requests, #559 (blange48) and #639 (JeanP00l), for explicit split points. Here it also works
+with `--layer-split auto`: every card loads everything first, the search counts what trimming will free on each card
+when it places the boundary, and then each card reloads only its own layers before the sessions and caches are made.
+
+On this PC that frees 1.9 GiB on the 4060 Ti and 1.3 GiB on the 5080. Same engine, `--no-trim-stage-weights`
+against the default, K=20:
+
+| | code | prose | code, 32K context | prose, 32K context | 32K prompt |
+|---|---:|---:|---:|---:|---:|
+| IQ2_XS, every card holds every layer | 162 | 109 | 149 | 100 | 1,899 |
+| IQ2_XS, own layers only | 172 | 111 | 157 | 104 | 2,201 |
+| IQ3_XXS (160K context), every layer | 141 | 95 | 98 | 71 | 1,006 |
+| IQ3_XXS, own layers only | 144 | 97 | 131 | 92 | 1,978 |
+
+IQ3_XXS gains the most. Its experts are bigger, and before this change the ones no card held did not all fit in RAM,
+so about 2,400 of them were read from the SSD in one benchmark run. With 2,174 more of them in VRAM the rest fit, and
+none are read from the SSD. The automatic split still picks K=20 for it.
+
+More experts in VRAM means more of them computed by the GPU, which rounds differently from the CPU (see
+[Is the output still the same model?](#is-the-output-still-the-same-model)). On the 5,335 tokens of that comparison, IQ3_XXS with and without trimming picked the same top token at 93.5%
+of the positions, with a perplexity of 6.95 and 7.03.
+
 ## Where it ended up
 
 The stock draft head throughout, decode in tokens per second:
@@ -175,6 +201,7 @@ seeded sampling, and runs with forced rollbacks.
 | `--vram-reserve-later-mib N` | VRAM left free on the later cards of a split |
 | `--pipeline-windows 0/1/2` | pipelined windows; 2 by default on a two-GPU split |
 | `--layer-split auto` | balances the two stages when pipelined (section 6) |
+| `--no-trim-stage-weights` | every card keeps the dense weights of all the layers (section 9) |
 | `--adapt-async 0` | the blocking adaptive tier |
 | `--list-gpus` | prints the visible cards and exits |
 | `"gpu_order": "as_given"` | the server keeps the config's card order |

@@ -34,6 +34,7 @@ half of every step on my PC), most of the work went into making them run at the 
   one. On by default with two GPUs.
 - The faster card goes last, since it also runs the output head and the draft model, and the automatic split
   balances the two cards for pipelining. The server orders the cards by itself.
+- Each card keeps only the weights of the layers it runs, and the VRAM this frees goes to its expert cache.
 - Adaptive expert swaps between VRAM and RAM no longer stop decoding while they copy.
 - Fewer host waits and kernel launches per step: device-side flags between the cards, the draft chain in one CUDA
   graph, programmatic dependent launch on RTX 50 cards.

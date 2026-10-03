@@ -531,6 +531,9 @@ struct Options {
     /// verifies K (rolled back when K is not fully accepted).  0 = off.  -1 (the default): 2 when the layer split runs
     /// on exactly two GPUs, else 0.
     int pipeline_windows = -1;
+    /// A layer split: each card keeps the dense weights of its own layers only (the rest of the model's are another
+    /// card's), and the VRAM this frees goes to its expert cache.  --no-trim-stage-weights: every card keeps them all.
+    bool trim_stage_weights = true;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -705,6 +708,9 @@ void usage() {
                  "  --pipeline-windows N --serve, a layer split on two GPUs: 2 = stage 0 runs window K+1 while\n"
                  "                       stage 1 verifies K (the default there), 1 = only the prompt's windows,\n"
                  "                       0 = off (the stages take turns).\n"
+                 "  --no-trim-stage-weights  a layer split: every card keeps the dense weights of all the layers,\n"
+                 "                       as before.  By default each card keeps only those of the layers it runs\n"
+                 "                       and the VRAM this frees goes to its expert cache.\n"
                  "  --list-gpus          print the visible CUDA devices (SMs, clock, VRAM, compute capability)\n"
                  "                       and exit; the server orders a split's cards with it.\n"
                  "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
@@ -894,6 +900,8 @@ struct GpuStage {
     int dev = 0;
     int64_t lb = 0, le = 0;
     double pcie_frac = 0.0;
+    void* arena = nullptr;                               ///< its dense weights (`wt`)
+    uint64_t arena_bytes = 0;
     strata::core::WeightTable wt;
     strata::core::NativeDense dense;
     strata::core::NativeHead head;
@@ -1468,6 +1476,8 @@ int main(int argc, char** argv) {
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::atoi(next("--pipeline-windows")));
+        else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
+        else if (a == "--no-trim-stage-weights") o.trim_stage_weights = false;
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
@@ -2362,6 +2372,59 @@ int main(int argc, char** argv) {
     // module was built and parity-tested, and nothing called it.  Everything below is construction - the table
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
+    // the six layer-1 weights the PLE reads, from CUDA0's table (again after a trimmed split reloads it)
+    auto wire_ple = [&](const strata::core::WeightTable& t) -> bool {
+        const strata::core::WeightRef* wk = t.find("blk.1.ple_key.weight");
+        const strata::core::WeightRef* wv = t.find("blk.1.ple_value.weight");
+        const strata::core::WeightRef* wnk = t.find("blk.1.ple_norm_key.weight");
+        const strata::core::WeightRef* wnq = t.find("blk.1.ple_norm_query.weight");
+        const strata::core::WeightRef* wnc = t.find("blk.1.ple_norm_conv.weight");
+        const strata::core::WeightRef* wc = t.find("blk.1.ple_conv1d.weight");
+        if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
+            std::fprintf(stderr, "strata generate: the pack has no blk.1.ple_* tensors, so the PLE cannot be "
+                                 "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
+            return false;
+        }
+        // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
+        // by the sizes the `WeightRef` records rather than re-derived - the same rule `plane_ptrs` follows.
+        if (!wk->quantized()) {
+            // plan v0.3 P6: the IQ model files' BF16 key (the pack's extra.bin, raw BF16)
+            ss.ple.w.key_bf16 = (const uint16_t*) wk->data;
+        } else if (wk->data != nullptr) {
+            ss.ple.w.key_codes = (const uint8_t*) wk->data;
+            ss.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
+        }
+        if (o.native_ple_key && wk->quantized()) {
+            if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 && wk->native_type != 23 &&
+                                     wk->native_type != 8) || !wk->native_q8_1) {
+                std::fprintf(stderr, "strata generate: native PLE key is absent or incompatible\n");
+                return false;
+            }
+            ss.ple.w.key_native_data = wk->native_data;
+            ss.ple.w.key_native_type = wk->native_type;
+            ss.ple.w.key_native_q8_1 = wk->native_q8_1;
+        }
+        ss.ple.w.value_bf16 = (const uint16_t*) wv->data;
+        ss.ple.w.norm_key = (const float*) wnk->data;
+        ss.ple.w.norm_query = (const float*) wnq->data;
+        ss.ple.w.norm_conv = (const float*) wnc->data;
+        // The conv1d kernel reads F16, so this cast is a claim about the pack's storage.  A checkpoint that keeps
+        // the tensor F32 (Q8_0, UD-Q4_K_XL) would hand the kernel the low halves of the f32 words - not an error,
+        // a plausible wrong layer-1 routing.  tools/iq_pack.py narrows it (index kind 3); a pack that did not is
+        // refused here (#255, gopinath87607).  F16 is index kind 5 or 3 (F16InF32) in a native pack and kind 0
+        // (verbatim 2-byte F16) in the canonical Q2_0 pack; BF16 (kind 4) has the same size and is not F16.
+        const bool f16 = wc->kind == strata::core::WeightKind::F16InF32 ||
+                         (wc->kind == strata::core::WeightKind::Verbatim && wc->code_bits == 0);
+        if (!f16 || wc->bytes != (uint64_t) wc->elements * 2) {
+            std::fprintf(stderr, "strata generate: blk.1.ple_conv1d.weight is not stored as F16 (pack index kind %d, "
+                                 "%llu B for %lld values); the PLE conv1d kernel reads F16 - repack with "
+                                 "tools/iq_pack.py\n",
+                         (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
+            return false;
+        }
+        ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
+        return true;
+    };
     strata::kernels::PleTable ple_table;
     std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
@@ -2399,55 +2462,7 @@ int main(int argc, char** argv) {
                                  "(STRATA_SSD_KEEPALIVE=0 turns it off)\n", pio.keepalive_ms, pio.keepalive_window_s);
         else if (pio.mode == strata::kernels::PleIo::Direct)
             std::fprintf(stderr, "strata generate: SSD keep-alive off: the SSD may fall asleep between reads\n");
-        const strata::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
-        const strata::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
-        const strata::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
-        const strata::core::WeightRef* wnq = wt.find("blk.1.ple_norm_query.weight");
-        const strata::core::WeightRef* wnc = wt.find("blk.1.ple_norm_conv.weight");
-        const strata::core::WeightRef* wc = wt.find("blk.1.ple_conv1d.weight");
-        if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
-            std::fprintf(stderr, "strata generate: the pack has no blk.1.ple_* tensors, so the PLE cannot be "
-                                 "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
-            return 1;
-        }
-        // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
-        // by the sizes the `WeightRef` records rather than re-derived - the same rule `plane_ptrs` follows.
-        if (!wk->quantized()) {
-            // plan v0.3 P6: the IQ model files' BF16 key (the pack's extra.bin, raw BF16)
-            ss.ple.w.key_bf16 = (const uint16_t*) wk->data;
-        } else if (wk->data != nullptr) {
-            ss.ple.w.key_codes = (const uint8_t*) wk->data;
-            ss.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
-        }
-        if (o.native_ple_key && wk->quantized()) {
-            if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 && wk->native_type != 23 &&
-                                     wk->native_type != 8) || !wk->native_q8_1) {
-                std::fprintf(stderr, "strata generate: native PLE key is absent or incompatible\n");
-                return 1;
-            }
-            ss.ple.w.key_native_data = wk->native_data;
-            ss.ple.w.key_native_type = wk->native_type;
-            ss.ple.w.key_native_q8_1 = wk->native_q8_1;
-        }
-        ss.ple.w.value_bf16 = (const uint16_t*) wv->data;
-        ss.ple.w.norm_key = (const float*) wnk->data;
-        ss.ple.w.norm_query = (const float*) wnq->data;
-        ss.ple.w.norm_conv = (const float*) wnc->data;
-        // The conv1d kernel reads F16, so this cast is a claim about the pack's storage.  A checkpoint that keeps
-        // the tensor F32 (Q8_0, UD-Q4_K_XL) would hand the kernel the low halves of the f32 words - not an error,
-        // a plausible wrong layer-1 routing.  tools/iq_pack.py narrows it (index kind 3); a pack that did not is
-        // refused here (#255, gopinath87607).  F16 is index kind 5 or 3 (F16InF32) in a native pack and kind 0
-        // (verbatim 2-byte F16) in the canonical Q2_0 pack; BF16 (kind 4) has the same size and is not F16.
-        const bool f16 = wc->kind == strata::core::WeightKind::F16InF32 ||
-                         (wc->kind == strata::core::WeightKind::Verbatim && wc->code_bits == 0);
-        if (!f16 || wc->bytes != (uint64_t) wc->elements * 2) {
-            std::fprintf(stderr, "strata generate: blk.1.ple_conv1d.weight is not stored as F16 (pack index kind %d, "
-                                 "%llu B for %lld values); the PLE conv1d kernel reads F16 - repack with "
-                                 "tools/iq_pack.py\n",
-                         (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
-            return 1;
-        }
-        ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
+        if (!wire_ple(wt)) return 1;
         ss.ple.consts = strata::kernels::ple_artifact_consts();
         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
         ss.ple.table = &ple_table;
@@ -2549,6 +2564,8 @@ int main(int argc, char** argv) {
                          (unsigned long long) (total_b >> 20));
             return 1;
         }
+        st.arena = arena_s;
+        st.arena_bytes = pool_bytes;
         if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
                          err.c_str());
@@ -2705,6 +2722,41 @@ int main(int argc, char** argv) {
                                  (drafter ? kDrafterMib : 0)) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
+    // ---- TRIMMED STAGE WEIGHTS (the default with a split, --no-trim-stage-weights: off).  Every card has just
+    // loaded the dense weights of all the layers and runs only its own: once the split is known each one reloads
+    // its own layers' (below), and the search counts what that frees towards the card's expert cache.  On a 4060
+    // Ti + 5080 with Swift 1.5 IQ3_XXS at K=20 that was 1.9 + 1.3 GiB, 2,174 more cached experts and none left to
+    // read from the files: 98 -> 131 tok/s on code at a 32K context, its prompt 1,006 -> 1,978 tok/s.
+    const bool trim = o.trim_stage_weights && multi_gpu && !stages.empty();
+    std::vector<std::vector<std::string>> layer_rows((size_t) g.n_layers);   // the arena's blk.<l>. rows
+    std::vector<int64_t> trim_prefix((size_t) g.n_layers + 1, 0);           // the bytes of layers [0, l)
+    if (trim) {
+        if (std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb")) {
+            char line[1024], name[256];
+            while (std::fgets(line, sizeof line, f))
+                if (line[0] != '#' && std::sscanf(line, "%255s", name) == 1 && std::strncmp(name, "blk.", 4) == 0 &&
+                    !skip.count(name)) {
+                    const long l = std::strtol(name + 4, nullptr, 10);
+                    if (l >= 0 && l < g.n_layers) layer_rows[(size_t) l].push_back(name);
+                }
+            std::fclose(f);
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            std::set<std::string> without = skip;
+            without.insert(layer_rows[(size_t) l].begin(), layer_rows[(size_t) l].end());
+            uint64_t rest = pool_bytes;
+            if (!strata::core::WeightTable::pool_bytes(o.pack, rest, err, &without)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            trim_prefix[(size_t) l + 1] = trim_prefix[(size_t) l] + (int64_t) (pool_bytes - rest) +
+                                          (int64_t) native_dense.bytes_in(l, l + 1);
+        }
+    }
+    // what a stage that runs [lb, le) frees by trimming (until then every card holds every layer)
+    auto trim_frees = [&](int64_t lb, int64_t le) -> int64_t {
+        return trim ? trim_prefix[(size_t) g.n_layers] - (trim_prefix[(size_t) le] - trim_prefix[(size_t) lb]) : 0;
+    };
     if (multi_gpu && split_auto) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int ns = (int) stages.size() + 1;
@@ -2740,7 +2792,8 @@ int main(int argc, char** argv) {
             for (int i = 0; i < ns; ++i) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
                 const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
-                capr[(size_t) i] = cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le);
+                capr[(size_t) i] = cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) +
+                                   trim_frees(lb, le);
             }
             std::fill(used.begin(), used.end(), 0);
             held_mass = 0;
@@ -2821,6 +2874,52 @@ int main(int argc, char** argv) {
                          (long long) split_at[i], (long long) (g.n_layers - 1));
             return 2;
         }
+    // ---- the trimmed stage weights (see above): each card reloads only its own layers' dense weights.  Nothing
+    // holds a pointer into the old copies yet but the PLE's six layer-1 weights, which are wired again.
+    if (trim) {
+        auto reload = [&](int dev, int64_t lo, int64_t hi, void*& base, uint64_t& base_bytes,
+                          strata::core::WeightTable& table, strata::core::NativeDense& dense) -> bool {
+            const strata::core::OnDevice on(dev);
+            std::set<std::string> sk = skip;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                if (l < lo || l >= hi) sk.insert(layer_rows[(size_t) l].begin(), layer_rows[(size_t) l].end());
+            uint64_t bytes = 0;
+            if (!strata::core::WeightTable::pool_bytes(o.pack, bytes, err, &sk)) return false;
+            dense.release();
+            table = strata::core::WeightTable{};
+            cudaFree(base);
+            base = nullptr;
+            if (cudaMalloc(&base, bytes) != cudaSuccess) {
+                cudaGetLastError();
+                err = "the trimmed weight arena could not be allocated";
+                return false;
+            }
+            base_bytes = bytes;
+            return table.load(o.pack, base, bytes, err, &sk) &&
+                   (o.native_dense_gguf.empty() ||
+                    dense.load(o.native_dense_gguf, table, err, o.native_ple_key, lo, hi));
+        };
+        const int64_t before = trim_prefix[(size_t) g.n_layers];
+        std::string kept;
+        for (size_t i = 0; i <= stages.size(); ++i) {
+            const int64_t lo = i == 0 ? 0 : split_at[i - 1], hi = i < split_at.size() ? split_at[i] : g.n_layers;
+            const bool ok = i == 0 ? reload(0, lo, hi, arena, pool_bytes, wt, native_dense) &&
+                                         (o.ple_gguf.empty() || wire_ple(wt))
+                                   : reload(stages[i - 1]->dev, lo, hi, stages[i - 1]->arena, stages[i - 1]->arena_bytes,
+                                            stages[i - 1]->wt, stages[i - 1]->dense);
+            const int dev = i == 0 ? 0 : stages[i - 1]->dev;
+            if (!ok) {
+                std::fprintf(stderr, "strata generate: layer split, CUDA%d: its own layers' weights: %s\n", dev,
+                             err.c_str());
+                return 1;
+            }
+            kept += (kept.empty() ? "" : ", ") + std::string("CUDA") + std::to_string(dev) + " " +
+                    std::to_string(lo) + "-" + std::to_string(hi - 1) + " (" +
+                    std::to_string(trim_frees(lo, hi) >> 20) + " MiB freed)";
+        }
+        std::fprintf(stderr, "strata generate: layer split: each card keeps only its own layers' dense weights "
+                             "(%.2f GiB in all): %s\n", (double) before / 1073741824.0, kept.c_str());
+    }
     // the stage that runs a layer (0: CUDA0's)
     auto stage_of = [&](int64_t l) -> int {
         int st = 0;
@@ -3552,7 +3651,12 @@ int main(int argc, char** argv) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
-            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+            const strata::core::WeightTable* owner = &wt;   // the card that runs the layer holds its router
+            int owner_dev = 0;
+            for (const auto& st : stages)
+                if (l >= st->lb && l < st->le) { owner = &st->wt; owner_dev = st->dev; }
+            const strata::core::OnDevice on_owner(owner_dev);
+            const strata::core::WeightRef* w = owner->find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
             ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
                  w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
             if (!ok) break;
