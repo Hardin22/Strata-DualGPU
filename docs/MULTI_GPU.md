@@ -102,6 +102,10 @@ it goes).
 A card holding more experts can change which experts run on the GPU, so the output can differ slightly from a run
 without it.
 
+**A separate VRAM reserve for the later cards:** `--vram-reserve-later-mib N` (default: `--vram-reserve-mib`'s value).
+The card that drives the monitors needs more headroom than one that drives none; with the display on the last card,
+`--vram-reserve-mib 300 --vram-reserve-later-mib 1800` gives the first card's cache that VRAM.
+
 **auto** tries every placement (all of them for two or three cards; proportional to the free VRAM beyond that) and
 keeps the one whose caches would hold the most of the expert profile, hottest pairs weighted most; ties go to the
 placement that leaves the fullest card the most room. The startup log prints the choice:
