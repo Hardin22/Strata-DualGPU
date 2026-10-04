@@ -248,6 +248,21 @@ bool cpu_gather_fast_here() {
     return here == 1;
 }
 
+bool cpu_avxvnni_ok() {
+    static const bool ok = [] {
+        if (const char* v = std::getenv("STRATA_NO_AVXVNNI"); v != nullptr && std::atoi(v) != 0) return false;
+        if (isa_floor_build()[0] != '\0' || cpu_isa_cap() < 3 || !cpu_avx2_ok()) return false;
+        unsigned r[4];
+        cpuid_regs(0, 0, r);
+        if (r[0] < 7) return false;
+        cpuid_regs(7, 0, r);
+        if (r[0] < 1) return false;            // no sub-leaf 1
+        cpuid_regs(7, 1, r);
+        return ((r[0] >> 4) & 1u) != 0;        // AVX-VNNI; VEX-encoded, so the OS state is AVX's (cpu_avx2_ok)
+    }();
+    return ok;
+}
+
 std::string cpu_name() {
     unsigned r[12] = {};
 #if defined(_MSC_VER)

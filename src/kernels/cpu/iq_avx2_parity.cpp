@@ -81,7 +81,7 @@ std::string variant_name(int) { return "dispatch"; }
 #else
 constexpr bool kVariants = true;
 int gu_variants() { return cpu::iq256_variants(); }
-int down_variants() { return 0; }
+int down_variants() { return cpu::iq256_variants() & cpu::kIq256Vnni; }
 void gu_rows_v(int v, int type, const uint8_t* blob, size_t gu_row, size_t up_off, const void* const* act, int nt,
                float* const* ff) {
     cpu::iq256_gu_rows_v(v, type, blob, gu_row, up_off, (int) kH, act, nt, ff, 0, (int) kFF);
@@ -89,16 +89,17 @@ void gu_rows_v(int v, int type, const uint8_t* blob, size_t gu_row, size_t up_of
 void gate_rows_v(int v, int type, const uint8_t* w, size_t row_bytes, const void* const* act, int nt, float* const* out) {
     cpu::iq256_rows_v(v, type, w, row_bytes, (int) kH, act, nt, out, 0, (int) kFF);
 }
-void iq4nl_rows_v(int, const uint8_t* w, size_t row_bytes, const void* const* hq, int nt, float* const* out) {
-    cpu::iq4nl256_down_rows(w, row_bytes, (int) kFF, hq, nt, out, 0, (int) kH);
+void iq4nl_rows_v(int v, const uint8_t* w, size_t row_bytes, const void* const* hq, int nt, float* const* out) {
+    cpu::iq4nl256_down_rows_v(v, w, row_bytes, (int) kFF, hq, nt, out, 0, (int) kH);
 }
-void q2_rows_v(int, const uint8_t* w, size_t row_bytes, const cpu::ActQ* const* a, int nt, float* const* out) {
-    cpu::q2_0_gguf_rows_multi_avx2(w, row_bytes, (int) (kFF / 64), a, nt, out, 0, (int) kH);
+void q2_rows_v(int v, const uint8_t* w, size_t row_bytes, const cpu::ActQ* const* a, int nt, float* const* out) {
+    cpu::q2_0_gguf_rows_multi_avx2_v((v & cpu::kIq256Vnni) != 0, w, row_bytes, (int) (kFF / 64), a, nt, out, 0, (int) kH);
 }
 std::string variant_name(int v) {
     if (v == 0) return "scalar";
     std::string s;
     if (v & cpu::kIq256Gather) s += "gather";
+    if (v & cpu::kIq256Vnni) s += s.empty() ? "vnni" : "+vnni";
     return s;
 }
 #endif
