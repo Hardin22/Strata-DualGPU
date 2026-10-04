@@ -105,7 +105,9 @@ without it.
 **The resident RAM mode works on a split** (`--resident-experts`, the low-RAM mode). The RAM copy of the experts
 leaves out the ones every card's cache holds, not only the first card's, and when the rest does not fit whole it keeps
 the hottest by the expert profile over all the layers. An adaptive swap copies the evicted expert back into RAM from
-the card that owns its layer. Before, `--resident-experts` with a split ran as `--mmap-experts`. Swift 1.5 IQ3_XXS at
+the card that owns its layer. Before, `--resident-experts` with a split ran as `--mmap-experts`, and setup recommended
+one card in the low-RAM mode; with an engine that has it (`RESIDENT_SPLIT_ENGINE` in setup.py), setup keeps the cards
+together and the experts no card holds in RAM. Swift 1.5 IQ3_XXS at
 160K (q4_0 KV, `--prefill 4096`, `--spec 4` with the stock draft layer), RTX 4060 Ti (layers 0-19) + RTX 5080 (20-47),
 i9-14900KF, 32 GB of RAM, Windows 11, four greedy prompts at a time, decode tok/s:
 

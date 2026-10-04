@@ -244,6 +244,24 @@ class LowRamGpus(unittest.TestCase):
         self.assertEqual(cfg["gpu"], 0)
         self.assertFalse(any("Low-RAM mode" in q for q in asked), asked)
 
+    def test_low_ram_on_gpus_with_a_resident_split_engine(self):
+        """#642: an engine that runs the resident variant on a layer split keeps the cards together, resident."""
+        ram, found = PROFILES["32GB-2x24GB"]
+        with mock.patch.object(setup, "MIN_ENGINE", setup.RESIDENT_SPLIT_ENGINE):
+            code, out, cfg, asked = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start"],
+                                            answers="")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(cfg["gpu"], [0, 1])
+            self.assertIn("--resident-experts", cfg["args"])
+            self.assertFalse(any("Low-RAM mode" in q for q in asked), asked)
+            self.assertIn("stay in RAM", out)
+            code, out, cfg, _ = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start",
+                                                     "--gpus", "0,1", "--low-ram", "resident"])
+            self.assertEqual(code, 0, out)
+            self.assertEqual(cfg["gpu"], [0, 1])
+            self.assertIn("--resident-experts", cfg["args"])
+            self.assertNotIn("no layer split yet", out)
+
 
 class StartOnSeveralGpus(unittest.TestCase):
     """A resident low-RAM config started on several GPUs reads the experts through the file cache (#364 #384)."""
@@ -279,6 +297,18 @@ class StartOnSeveralGpus(unittest.TestCase):
         self.assertEqual(cfg["args"], ["--mmap-experts", "--remote-expert-opt"])   # 0.1.39b: #578 on 2+ GPUs
         code, out, asked, cfg = self.offer(["--mmap-experts"], None)           # other configs: as before
         self.assertEqual(cfg["gpu"], [0, 1])
+
+    def test_resident_split_engine_keeps_a_resident_config(self):
+        """#642: from RESIDENT_SPLIT_ENGINE a resident config is offered both cards as any other, and stays resident."""
+        with mock.patch.object(setup, "MIN_ENGINE", setup.RESIDENT_SPLIT_ENGINE):
+            cfg = {"args": ["--pack", "p", "--resident-experts", "--kv", "int8"]}
+            self.assertFalse(setup.split_mmap(cfg))
+            self.assertEqual(cfg["args"], ["--pack", "p", "--resident-experts", "--kv", "int8"])
+            code, out, asked, cfg = self.offer(["--resident-experts"], None)   # --yes: the recommendation
+            self.assertIsNone(code, out)
+            self.assertEqual(cfg["gpu"], [0, 1])
+            self.assertEqual(cfg["args"], ["--resident-experts", "--remote-expert-opt"])
+            self.assertNotIn("OS file cache", out)
 
     def test_start_with_gpus(self):
         found = PROFILES["32GB-2x24GB"][1]
