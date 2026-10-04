@@ -117,7 +117,13 @@ __device__ __forceinline__ void cp16(void* dst, const void* src) {
                  "l"(src));
 }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void pf_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];\n" ::"l"(p)); }
+__device__ __forceinline__ void pf_l2(const void* p) {
+#if !defined(__HIPCC__)
+    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(p));
+#else
+    (void)p;
+#endif
+}
 template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
 // d = MAGIC + A (16 x 32 s8, row) * B (32 x 8 s8, col): the int32 dot with the magic bias already added (the C
 // operand), so as_float(d) - 1.5 * 2^23 is the dot as a float
