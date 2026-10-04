@@ -102,6 +102,23 @@ it goes).
 A card holding more experts can change which experts run on the GPU, so the output can differ slightly from a run
 without it.
 
+**The resident RAM mode works on a split** (`--resident-experts`, the low-RAM mode). The RAM copy of the experts
+leaves out the ones every card's cache holds, not only the first card's, and when the rest does not fit whole it keeps
+the hottest by the expert profile over all the layers. An adaptive swap copies the evicted expert back into RAM from
+the card that owns its layer. Before, `--resident-experts` with a split ran as `--mmap-experts`. Swift 1.5 IQ3_XXS at
+160K (q4_0 KV, `--prefill 4096`, `--spec 4` with the stock draft layer), RTX 4060 Ti (layers 0-19) + RTX 5080 (20-47),
+i9-14900KF, 32 GB of RAM, Windows 11, four greedy prompts at a time, decode tok/s:
+
+| | first four prompts | after three more rounds |
+|---|---|---|
+| 5080 alone, `--resident-experts` | 25 | 29 |
+| split, `--mmap-experts` (what `--resident-experts` became on a split) | 32 | 64 |
+| split, `--resident-experts` (22 GiB of experts locked in RAM) | 71 | 69 |
+
+The split with `--mmap-experts` catches up once the OS file cache holds the experts, on a PC with nothing else
+running; the resident copy is there from the first request and stays locked when other programs need the RAM. With
+`--pcie-frac 0 --adapt-every 0` the split's greedy output is the same with either mode.
+
 **A separate VRAM reserve for the later cards:** `--vram-reserve-later-mib N` (default: `--vram-reserve-mib`'s value).
 The card that drives the monitors needs more headroom than one that drives none; with the display on the last card,
 `--vram-reserve-mib 300 --vram-reserve-later-mib 1800` gives the first card's cache that VRAM.
