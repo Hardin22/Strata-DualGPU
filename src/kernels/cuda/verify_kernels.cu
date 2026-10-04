@@ -358,6 +358,12 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
     steps[i * 4 + 3] = c + 1;
 }
 
+// --pipeline-windows: the drafter's chain, teacher forced (see force_token)
+__global__ void force_token_kernel(int32_t* tok, const int32_t* force, int j) {
+    const int32_t f = ((const volatile int32_t*) force)[j];
+    if (f >= 0) *tok = f;
+}
+
 }  // namespace
 
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
@@ -389,6 +395,11 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
     mtp_select_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,
                                                             probs, out_p);
     check("mtp_select");
+}
+
+void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {
+    force_token_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(tok, force, j);
+    check("force_token");
 }
 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream) {
