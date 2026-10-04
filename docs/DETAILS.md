@@ -90,7 +90,9 @@ slightly differently. How many tokens share an expert depends on the drafts in a
 at temperature 0 can end in a different (equally good) answer when the drafting, the cache state or a resumed
 conversation differ (issue #152). `STRATA_IQ_MT_MIN=1` (in the config's `env`) uses the multi-token kernels for
 every group: the answer then no longer depends on the drafting. Measured on a Ryzen 7600 (AVX-512): IQ3_S decode
--1..-3%, the other models the same; the default stays the fastest rule. Through the server, two more things carry
+-1..-3%, the other models the same; the default stays the fastest rule. On an Intel CPU of Alder Lake or later
+without AVX-512, where the AVX-2 kernel gathers the IQ3_S grid, IQ3_S takes the multi-token kernel for one token by
+default, because there it is the faster one (`STRATA_IQ_MT_MIN=2` restores ggml's dot). Through the server, two more things carry
 over from one request to the next (#410): the adaptive tier moves experts between RAM and VRAM (the GPU and the CPU
 round an expert differently), and the prompt cache resumes a repeated prompt and reads only its tail through the
 decode path. For byte-identical repeats add `--prompt-cache 0 --adapt-swaps 0 --pcie-frac 0` to the engine's args
