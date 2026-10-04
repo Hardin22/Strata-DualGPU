@@ -285,10 +285,13 @@ Verifier::~Verifier() {
         if (kv.second) cudaGraphExecDestroy(kv.second);
     if (arena_b_) cudaFree(arena_b_);
     if (h_commitb_) cudaFreeHost(h_commitb_);
-    if (cs_) cudaStreamDestroy(cs_);
+    if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
+    if (ev_done_) cudaEventDestroy(ev_done_);
+    if (ev_commit_) cudaEventDestroy(ev_commit_);
+    if (prof_pin_) cudaFreeHost(prof_pin_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (arena_) cudaFree(arena_);
@@ -477,8 +480,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: copy stream create failed";
         return false;
     }
-    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess ||
-        cudaStreamCreateWithFlags(&sh_cs_, cudaStreamNonBlocking) != cudaSuccess) {
+    if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
+    else if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) cs_ = nullptr;
+    if (cs_ == nullptr || cudaStreamCreateWithFlags(&sh_cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
     }
@@ -511,7 +515,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-        device_plan_ = !all_resident_ && (v != nullptr && std::atoi(v) != 0);
+        // (not with set_always_publish: the device table may lag the host's while windows are in flight)
+        device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
     }
     if (all_resident_ || device_plan_) {
         bool ok2 = true;
@@ -950,7 +955,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                        m_ids_ + tb * K, m_w_ + tb * K, m_seq_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
             else
 #endif
-            if (remote_opt_)   // #578: the helper GPUs reduce with the routing weights - publish them
+            // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
+            // whatever the device's residency table says (pipelined windows)
+            if (remote_opt_ || always_publish_)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
             else {
@@ -1354,10 +1361,14 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 }
 
 void Verifier::collect_profile() {
-    const ModelGeometry& g = *g_;
     cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
+    accumulate_profile(prof_h_.data());
+}
+
+void Verifier::accumulate_profile(const unsigned long long* stamps) {
+    const ModelGeometry& g = *g_;
     const int64_t L = g.n_layers;
-    auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
+    auto at = [&](int64_t l, int i) { return stamps[(size_t) (l * kProfPer + i)]; };
     // D8: the derived columns below read stamps the hc-read kernels write themselves or the next
     // layer's first.  A slot no kernel stamped is 0 and its unsigned difference wrapped to ~1e19 ns -
     // which is why (gap)/head/hc0 printed ~1e14 ms per window.  A missing or out-of-order stamp now
@@ -1365,7 +1376,8 @@ void Verifier::collect_profile() {
     const auto gap = [](unsigned long long to, unsigned long long from) {
         return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : 0.0;
     };
-    for (int64_t l = 0; l < L; ++l) {
+    // only this stage's layers [lb_, le_) are ever stamped (a layer split); the head only on the last stage
+    for (int64_t l = lb_; l < le_; ++l) {
         const int kind = is_qsa_layer(g, l) ? 1 : 0;
         unsigned long long prev = at(l, 0);
         for (int i = 1; i <= 24; ++i) {
@@ -1374,7 +1386,7 @@ void Verifier::collect_profile() {
             prof_sum_[kind][i] += (double) (x - prev);
             prev = x;
         }
-        if (l + 1 < L) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
+        if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
         const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
         if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
             prof_sum_[kind][27] += dn;      // hc-read0: norm
@@ -1383,7 +1395,7 @@ void Verifier::collect_profile() {
             prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
         }
     }
-    prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
+    if (le_ == L) prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
     ++prof_windows_;
 }
 
@@ -2153,6 +2165,291 @@ bool Verifier::copy_logits(int t, float* host) const {
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+
+// ================================ PIPELINED WINDOWS (see verify.hpp) ================================
+//
+// The window is run()'s, step for step: the same graph, the same staging, the same per-layer service (the PLE rows
+// gathered while layer 0 is served, the zero-doorbell graph's one flag), the same commit graph.  Only the waits are
+// split up: the host polls instead of spinning, so it can serve the other stage's window in between.
+
+namespace {
+double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
+}  // namespace
+
+void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
+    auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
+    auto ev = [](cudaEvent_t e) {
+        if (e == nullptr) return "none";
+        const cudaError_t q = cudaEventQuery(e);
+        return q == cudaSuccess ? "done" : q == cudaErrorNotReady ? "PENDING" : "error";
+    };
+    std::fprintf(f, "  %s: %s T=%d pos %lld served %lld/%lld; GPU rang %u, flags served %u A %u B %u; window event %s, "
+                    "commit event %s (commit launched %d)\n", name, fl_active_ ? "IN FLIGHT" : "idle", last_t_,
+                 (long long) last_pos0_, (long long) fl_k_, (long long) fl_total_, rd(h_seq_), rd(h_flag_), rd(h_flagA_),
+                 rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
+}
+
+bool Verifier::capture_all(std::string& err) {
+    const OnDevice on_device(device_);
+    if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
+    if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
+    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    for (int T = 1; T <= max_t_; ++T)
+        if (!capture(T, err)) return false;
+    if (!capture_commit(err)) return false;
+    if ((ev_done_ == nullptr && cudaEventCreateWithFlags(&ev_done_, cudaEventDisableTiming) != cudaSuccess) ||
+        (ev_commit_ == nullptr && cudaEventCreateWithFlags(&ev_commit_, cudaEventDisableTiming) != cudaSuccess)) {
+        err = "verify: event create failed";
+        return false;
+    }
+    if (prof_on_ && prof_pin_ == nullptr &&
+        cudaHostAlloc((void**) &prof_pin_, prof_h_.size() * 8, cudaHostAllocDefault) != cudaSuccess) {
+        prof_pin_ = nullptr;   // the pipelined windows go unprofiled
+        cudaGetLastError();
+    }
+    pl_ple_rows_.assign((size_t) strata::kernels::kVerifyMaxT * strata::kernels::PLE_N_HEADS, 0u);
+    return true;
+}
+
+// The host staging of a pipelined window: run()'s (stage_inputs), and its PLE rows from `ple_prev` with their pages
+// prefetched (they are gathered into the mapped rows when layer 0 is served, as run() does).
+void Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]) {
+    using namespace strata::kernels;
+    stage_inputs(T, tokens, pos0);
+    staged_ = false;   // a later run() stages its own window
+    SessionState& ss = *ss_;
+    fl_ple_ = ss.ple.ready() && ple_stage();
+    if (fl_ple_) {
+        int32_t prev[2] = {ple_prev[0], ple_prev[1]};
+        for (int t = 0; t < T; ++t) {
+            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, pl_ple_rows_.data() + t * PLE_N_HEADS);
+            prev[0] = prev[1];
+            prev[1] = tokens[t];
+            ss.ple.table->prefetch_rows(pl_ple_rows_.data() + t * PLE_N_HEADS);
+        }
+    }
+    pl_prev_[0] = ple_prev[0];
+    pl_prev_[1] = ple_prev[1];
+}
+
+bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
+    if (fl_active_) { err = "verify: a window is in flight on this verifier"; return false; }
+    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (pl_ple_rows_.empty()) { err = "verify: pipelined window not prepared (capture_all)"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    pl_stage(T, tokens, pos0, ple_prev);
+    pl_prestaged_ = true;
+    ms_host += ms_since(t0);
+    return true;
+}
+
+bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+    const OnDevice on_device(device_);
+    if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
+    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    SessionState& ss = *ss_;
+    if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (exec_[T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
+        err = "verify: pipelined window not prepared (capture_all)";
+        return false;
+    }
+    const Clock::time_point t0 = Clock::now();
+    last_batch_ = false;
+    bool staged = pl_prestaged_ && last_t_ == T && last_pos0_ == pos0;
+    for (int t = 0; staged && t < T; ++t) staged = last_tokens_[t] == tokens[t];
+    if (staged && ss.ple.ready() && ple_stage())
+        staged = pl_prev_[0] == ss.ple_prev[0] && pl_prev_[1] == ss.ple_prev[1];
+    pl_prestaged_ = false;
+    if (!staged) pl_stage(T, tokens, pos0, ss.ple_prev);
+    const int G = groups_[T] > 0 ? groups_[T] : 1;
+    fl_T_ = T;
+    fl_k_ = 0;
+    fl_total_ = (le_ - lb_) * G;
+    fl_prof_ = prof_on_ && G == 1 && prof_pin_ != nullptr;
+    if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
+    ms_host += ms_since(t0);
+    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
+    if (cudaEventRecord(ev_done_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
+    (void) cudaStreamQuery(cs_);   // WDDM: submit now
+    fl_active_ = true;
+    fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
+    return true;
+}
+
+int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
+    if (!fl_active_) return 1;
+    if (fl_k_ >= fl_total_) return 1;
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const int T = fl_T_;
+    // the PLE rows into the mapped staging (layer 1's pre() copies them once flag 1 is up), as run() does at k == 0
+    auto gather_ple = [&]() -> bool {
+        if (!fl_ple_) return true;
+        const Clock::time_point tp = Clock::now();
+        if (!ss.ple.table->gather_batch(pl_ple_rows_.data(), (size_t) T, h_ple_, err)) return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        ms_host += ms_since(tp);
+        return true;
+    };
+    if (all_resident_) {   // the zero-doorbell graph never rings: it waits only for flag 1 (stage 0's PLE rows)
+        if (!gather_ple()) return -1;
+        *(volatile uint32_t*) h_flag_ = 1;
+        fl_k_ = fl_total_;
+        progress_tick();
+        return 1;
+    }
+    const int G = groups_[T] > 0 ? groups_[T] : 1;
+    const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    while (fl_k_ < fl_total_) {
+        const int64_t l = lb_ + fl_k_ / G;
+        const uint32_t want = (uint32_t) (fl_k_ + 1);
+        if (*(volatile uint32_t*) h_seq_ < want) {
+            const double now = now_ms();
+            if (now - fl_flush_ms_ > 2.0) {   // flush WDDM and notice a dead graph, as run() does
+                fl_flush_ms_ = now;
+                const cudaError_t q = cudaEventQuery(ev_done_);
+                if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < want) {
+                    trace_ev("NEVER-RANG", fl_k_, l, (int64_t) q);
+                    err = "verify: layer " + std::to_string(l) + " never rang (" +
+                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                    return -1;
+                }
+                (void) cudaStreamQuery(cs_);
+            }
+            if (now - fl_since_ms_ > 20000.0) {   // #267: no spin kernel may outlive the engine
+                trace_ev("TIMEOUT", fl_k_, l, 0);
+                err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
+                return -1;
+            }
+            return 0;
+        }
+        const Clock::time_point b = Clock::now();
+        ms_wait += now_ms() - fl_since_ms_;
+        const int grp = (int) (fl_k_ % G);
+        cur_layer_ = want - 1;
+        set_plan_slot(grp);
+        const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+        progress_at("verify window (pipelined): the CPU experts of layer", l);
+        if (pool != nullptr)
+            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", fl_k_, l,
+                              (int64_t) ms_since(b));
+        progress_tick();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+            sink_.counts[0] = 0;
+            sink_.counts[1] = 0;
+            sink_.counts[2] = 0;
+            sink_.start[0] = 0;
+            sink_.start2[0] = 0;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile uint32_t*) h_flagA_ = want;
+            raise_flag(h_flagB_, want);
+        }
+        if (fl_k_ == 0 && !gather_ple()) return -1;
+        *(volatile uint32_t*) h_flag_ = want;
+        ++fl_k_;
+        ms_pool += ms_since(b);
+        fl_since_ms_ = fl_flush_ms_ = now_ms();
+    }
+    return 1;
+}
+
+bool Verifier::done(std::string& err) {
+    if (!fl_active_ || fl_k_ < fl_total_) return false;
+    const OnDevice on_device(device_);
+    const cudaError_t q = cudaEventQuery(ev_done_);
+    if (q == cudaErrorNotReady) {
+        const double now = now_ms();
+        if (now - fl_flush_ms_ > 2.0) { fl_flush_ms_ = now; (void) cudaStreamQuery(cs_); }
+        if (now - fl_since_ms_ > 20000.0) {   // every layer served, and the graph still runs: #267 as above
+            err = "verify: the window never finished" + released_note(release_gpu_waits(5000));
+        }
+        return false;
+    }
+    if (q != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(q); return false; }
+    if (copy_used_) {   // no host function of this window may raise flag B in the next one
+        if (cudaStreamQuery(copy_) == cudaErrorNotReady) return false;
+        copy_used_ = false;
+    }
+    return true;
+}
+
+bool Verifier::pl_finish(int32_t* out, std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    fl_active_ = false;
+    if (fl_prof_) accumulate_profile(prof_pin_);
+    ++windows;
+    trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));
+    if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written
+    const int T = fl_T_;
+    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
+        SamplerParams sp = sampling_;
+        sp.counter = (uint64_t) last_pos0_;
+        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = "verify: the head sampling failed";
+            return false;
+        }
+    }
+    if (out != nullptr)
+        for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    progress_beat();
+    return true;
+}
+
+bool Verifier::pl_commit_async(int n_keep, std::string& err) {
+    const OnDevice on_device(device_);
+    if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    if (commit_live_) {   // its graph reads the words below when it starts: the previous one has (a window ago)
+        cudaError_t q;
+        while ((q = cudaEventQuery(ev_commit_)) == cudaErrorNotReady) _mm_pause();
+        if (q != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(q); return false; }
+    }
+    h_commit_[0] = n_keep;
+    h_commit_[1] = n_keep - 1;
+    for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+    if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+    if (cudaEventRecord(ev_commit_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
+    (void) cudaStreamQuery(cs_);
+    commit_live_ = true;
+    if (ple_stage())
+        for (int t = 0; t < n_keep; ++t) {
+            ss_->ple_prev[0] = ss_->ple_prev[1];
+            ss_->ple_prev[1] = last_tokens_[t];
+        }
+    ms_commit += ms_since(t0);
+    return true;
+}
+
+void Verifier::absorb_stats(Verifier& o) {
+    ms_wait += o.ms_wait; ms_pool += o.ms_pool; ms_host += o.ms_host; ms_commit += o.ms_commit;
+    windows += o.windows;
+    o.ms_wait = o.ms_pool = o.ms_host = o.ms_commit = 0;
+    o.windows = 0;
+    for (int k = 0; k < 2; ++k)
+        for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
+    prof_windows_ += o.prof_windows_;
+    o.prof_windows_ = 0;
 }
 
 }  // namespace strata::core
