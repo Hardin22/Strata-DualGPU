@@ -297,6 +297,12 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches
+    // on these side streams (record_window); the same kernels on the same inputs, only their order is freer
+    bool df_branch_ = false;
+    cudaStream_t df_side_[2] = {};
+    cudaEvent_t df_fork_ = nullptr;
+    cudaEvent_t df_join_[2] = {};
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
 

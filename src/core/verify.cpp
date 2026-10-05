@@ -21,6 +21,8 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_gr_postops.hpp"
+#include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
@@ -292,6 +294,11 @@ Verifier::~Verifier() {
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
+    for (cudaStream_t s : df_side_)
+        if (s) cudaStreamDestroy(s);
+    if (df_fork_) cudaEventDestroy(df_fork_);
+    for (cudaEvent_t e : df_join_)
+        if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
@@ -489,6 +496,21 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: event create failed";
         return false;
     }
+    {   // STRATA_DF_BRANCH (CUDA: default on; HIP: STRATA_DF_BRANCH=1, not measured there); 0: one stream, as before
+        const char* v = std::getenv("STRATA_DF_BRANCH");
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+        df_branch_ = v != nullptr && std::atoi(v) != 0;
+#else
+        df_branch_ = v == nullptr || std::atoi(v) != 0;
+#endif
+        if (df_branch_ && df_fork_ == nullptr) {
+            bool okb = cudaEventCreateWithFlags(&df_fork_, cudaEventDisableTiming) == cudaSuccess;
+            for (int i = 0; i < 2 && okb; ++i)
+                okb = cudaStreamCreateWithFlags(&df_side_[i], cudaStreamNonBlocking) == cudaSuccess &&
+                      cudaEventCreateWithFlags(&df_join_[i], cudaEventDisableTiming) == cudaSuccess;
+            if (!okb) { cudaGetLastError(); df_branch_ = false; }
+        }
+    }
     // Check whether 100% of experts across [lb_, le_) are resident in this stage's VRAM cache.
     // When true, every layer plans on device and writes directly into parts_ without any CPU doorbells,
     // wait_flag_ge spins, PCIe empty launches, or moe_hit_add copies.
@@ -576,15 +598,36 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         explicit PdlScope(bool on) : prev(pdl_scope()) { pdl_scope() = on; }
         ~PdlScope() { pdl_scope() = prev; }
     } pdl_window(G == 1 && pdl_supported());
+    // STRATA_DF_BRANCH: mixer work that reads only the layer's input runs on a side stream inside the graph.  fork(i)
+    // makes side i depend on everything captured on `cs` so far, join(i) makes `cs` depend on everything captured on
+    // side i: a branch never races with what came before its fork or after its join.  Not in a split or batch window,
+    // nor under the stage profiler (whose stamps are on `cs`).
+    const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_;
+    auto fork = [&](int i) {
+        cudaEventRecord(df_fork_, cs);
+        cudaStreamWaitEvent(df_side_[i], df_fork_, 0);
+    };
+    auto join = [&](int i) {
+        cudaEventRecord(df_join_[i], df_side_[i]);
+        cudaStreamWaitEvent(cs, df_join_[i], 0);
+    };
     const int64_t nQall = g.n_qsa_layers();
     // a batch window: row t is slot t, whose state lives in its own session
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
 
-    // ---- the window's inputs, from mapped staging
+    // ---- the window's inputs, from mapped staging.  With branches the steps and positions (first read by the first
+    // layer's mixer) cross PCIe on side 1 beside the embedding and the first hyper-connection read.
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+    bool inputs_pending = false;
+    cudaStream_t in_s = cs;
+    if (br) {
+        fork(1);
+        in_s = df_side_[1];
+        inputs_pending = true;
+    }
+    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, in_s);
+    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), in_s);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
@@ -667,6 +710,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     return false;
                 }
             }
+            // STRATA_DF_PLE (default on): the window's post-projection steps in one pass, bitwise the per-token loop
+            // below (the norms divide at run time as its norms do; the history advances token by token), which also
+            // writes the commit's history snapshots.  Scratch: layer 0's expert rows, combined by now, and the
+            // hyper-connection read's `lo_`, which the read below rewrites.
+            static const bool ple_post_env = [] {
+                const char* e = std::getenv("STRATA_DF_PLE");
+                return !e || std::atoi(e) != 0;
+            }();
+            if (ple_batch_kv && ple_post_env && !batch_rec_) {
+                float* qn = parts_ + (size_t) tb * K * N;           // n x 10240 (K * N = 25600 per row)
+                float* gated = hit_out_ + (size_t) tb * K * N;      // n x 10240
+                float* pgate = lo_ + (size_t) tb * g.hc_lr;         // n x 4
+                try {
+                    if (gr_native_mmvf_enabled())   // gr_write's native write for the n rows in one launch
+                        native_gr_post_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, Rt(tb), (int) N, (int) HC, n, HC * N,
+                                             N, HC, cs);
+                    else
+                        for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+                    native_ple_postops_batch_snap(xn_ + (size_t) tb * HC * N, Rt(tb), z_ + (size_t) tb * N, ss.ple.hist,
+                                                  ss.ple.w, qn, gated, pgate, n, hist_snap_ + (size_t) tb * HS, cs);
+                } catch (const std::exception& e) {
+                    err = std::string("verify PLE (window): ") + e.what();
+                    return false;
+                }
+            } else
             for (int t = tb; t < te; ++t) {
                 gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
                 PleOut po;
@@ -704,6 +772,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
         gr_read_group(0, pending, inj2_, inj_);
+        if (inputs_pending) {   // the window's steps and positions, before the first mixer reads them
+            join(1);
+            inputs_pending = false;
+        }
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
         try {
@@ -726,6 +798,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                if (br) {   // STRATA_DF_BRANCH: a/b and z beside q/k/v and the conv; all of them read only this layer's input
+                    fork(0);
+                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                 (int) HV, n, df_side_[0]);
+                    fork(1);
+                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
+                                df_side_[1]);
+                }
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // each row from its own slot's conv history, one row each
@@ -739,12 +820,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 } else
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
                 stamp(l, 3, grp);
+                if (br) {   // gate, beta and z, before the recurrence reads them
+                    join(0);
+                    join(1);
+                } else {
                 gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
                 native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
                 stamp(l, 5, grp);
+                }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 if (batch_rec_) {   // each row's recurrence from its own slot's state, one token
                     for (int t = tb; t < te; ++t) {
@@ -773,17 +859,43 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
                     !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
                     return false;
+                auto norm_rope_on = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos,
+                                        cudaStream_t sx) {
+                    if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, sx);
+                    else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, sx);
+                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, sx);
+                    else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, sx);
+                };
                 auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
-                    if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, cs);
-                    else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, cs);
-                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, cs);
-                    else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, cs);
+                    norm_rope_on(data, norm, rows, cols, pos, cs);
                 };
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
-                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
+                // STRATA_DF_QB_Q4 (default on): a Q4_0 KV cache too - its one per-token extra, the query's rotation, is
+                // row-wise and the batched path rotates (270650e); 0: Q4_0 token by token, as before
+                static const bool qb_q4 = [] {
+                    const char* e = std::getenv("STRATA_DF_QB_Q4");
+                    return !e || std::atoi(e) != 0;
+                }();
+                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                // STRATA_DF_BRANCH: the query side (q and its norm/RoPE/rotation on side 0, the indexer query on side 1)
+                // beside the K/V side; the indexer query joins before the block scores, the query before attention
+                const bool qbr = br && qb;
+                if (qbr) {
+                    fork(0);
+                    native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                (int) (NH * 2 * HD), n, df_side_[0]);
+                    copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD,
+                                      df_side_[0]);
+                    norm_rope_on(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH, df_side_[0]);
+                    if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, df_side_[0]);   // <Hq, Hk> = <q, k>
+                    fork(1);
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
+                                              IQ * ID, N, IQ * ID, n, df_side_[1]);
+                    norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
+                }
                 if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
@@ -805,6 +917,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                          TS, cs);
                 } else
                 if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+                // STRATA_DF_KVAPP (default on): a Q4_0 window's K/V cells in one launch (the same stores); 0: per token
+                static const bool kv_multi = [] {
+                    const char* e = std::getenv("STRATA_DF_KVAPP");
+                    return !e || std::atoi(e) != 0;
+                }();
+                if (kv_multi && n > 1 && !batch_rec_ && st.kv_q4 && !st.kv_hybrid)
+                    kv_append_q4_step_multi(st.k_q4, st.v_q4, st.page_table, step_ + tb * kStepCount, kcur_ + tb * NKV * HD,
+                                            vcur_ + tb * NKV * HD, n, s, cs, &st.host);
+                else
                 for (int t = tb; t < te; ++t) {
                     const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
                     const int32_t* step_t = step_ + t * kStepCount;
@@ -831,6 +952,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               rope_scaling(), cs);
                 }
                 stamp(l, 9, grp);
+                if (qbr) {
+                    join(1);   // the indexer query, for the block scores
+                } else {
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
                 if (qb) {   // the q/gate split as a copy kernel: the window's chain stays kernel to kernel
@@ -857,6 +981,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
                 }
                 }
+                }
                 stamp(l, 10, grp);
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
@@ -880,6 +1005,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
+                if (qbr) join(0);   // the query, for attention
                 const QsaAttnPools pools = qsa_attn_pools(st);
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);

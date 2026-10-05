@@ -46,6 +46,12 @@ inline void fwht256_inplace_cuda(float* data, int64_t n_rows, void* stream) { fw
 void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                        const KvHostPools* host = nullptr);
+/// kv_append_q4_step for n tokens in one launch (the verify window's): token t's cell at step[t * kStepCount +
+/// kStepPos], its K/V rows at t * n_head_kv * 256.  The same per-group quantization and stores; the n cells must be
+/// distinct (a window's consecutive positions).
+void kv_append_q4_step_multi(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                             const float* kcur, const float* vcur, int n, const QsaShapes& s, void* stream,
+                             const KvHostPools* host = nullptr);
 
 /// The prompt path: T consecutive (rotated) cells from pos0, K/V [T, n_head_kv, 256]; also into `stage` (identity
 /// layout, the one-layer staging pool of a streamed session) when given.
