@@ -201,8 +201,9 @@ Two cards, exactly two stages, `--serve`. In the config:
   (`--split-device 0`), or no draft layer. A request with repetition penalties (`penalty_last_n`) or coupled
   draft sampling decodes serially.
 - **With the resident RAM mode's asynchronous swaps** (`--adapt-async 1`, [DETAILS.md](DETAILS.md)) a round's steps
-  advance once per verified window; the copy into an evicted slot and the move into a RAM place wait until both
-  cards have finished the windows that may still read them.
+  advance between the verified windows. Each card's copies are queued by the decode loop itself while that card has
+  no window in flight, after every window that may still read what they overwrite has finished; the moves into RAM
+  wait the same way.
 - **Measured** (Swift 1.5 IQ3_XXS, 160K context, q4_0 KV, the stock draft layer, RTX 4060 Ti (layers 0-19) +
   RTX 5080 (20-47), i9-14900KF, 32 GB of RAM with the resident RAM mode on the split (#848); greedy, 500 tokens, two
   interleaved pairs of three rounds, decode tok/s): Python code 90.4 -> 103.1, C code 76.6 -> 81.6, English prose

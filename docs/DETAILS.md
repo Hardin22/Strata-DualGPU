@@ -139,9 +139,9 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
 - `--adapt-async 1` (opt-in, `--serve`): the swaps of a round advance between decode windows on a helper thread
   (copy back, copy in, move into RAM) instead of one window waiting for the whole round. Not with `--batch` or
   `--peer-device` (the blocking tier runs there). With `--pipeline-windows 2` (two windows in flight, see
-  [MULTI_GPU.md](MULTI_GPU.md)) the copies into the evicted slots and the moves into RAM also wait until the windows
-  that were in flight when they were decided have completed (`STRATA_PIPELINE_ADAPT_ASYNC=0`: the blocking tier
-  there). It is not bit-exact from run to run: which window first computes a swapped-in expert on the GPU (which
+  [MULTI_GPU.md](MULTI_GPU.md)) the copies are queued by the decode loop itself while their card has no window in
+  flight, and the copies into the evicted slots and the moves into RAM wait until the windows that were in flight when
+  they were decided have completed (`STRATA_PIPELINE_ADAPT_ASYNC=0`: the blocking tier there). It is not bit-exact from run to run: which window first computes a swapped-in expert on the GPU (which
   rounds differently from the CPU) depends on when its copy lands.
 - The answers are the plain mapped mode's for the same expert placement: the bytes are the file's. With a page-locked
   copy the GPU also takes its usual share of the misses over PCIe (`--pcie-frac`), as with enough RAM; `--pcie-frac 0`
