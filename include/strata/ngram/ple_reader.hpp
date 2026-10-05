@@ -39,6 +39,11 @@ struct ReaderStats {
     uint64_t late_injected = 0;   ///< reads delayed by fault injection
     uint64_t keepalive_reads = 0; ///< pages read only to keep the SSD awake (not in `reads`, `bytes` or latencies)
     double keepalive_us_max = 0;  ///< the slowest of them
+    // STRATA_PL_PLE_PREFETCH: `prefetch`, not in `requests` / `cache_hits` (those stay the tickets' own rows)
+    uint64_t prefetch_rows = 0;     ///< rows `prefetch` sent to the SSD
+    uint64_t prefetch_skipped = 0;  ///< rows `prefetch` found in the row cache or already being read
+    uint64_t prefetch_reads = 0;    ///< SSD reads of those rows (also in `reads`, `bytes` and the latencies)
+    uint64_t attached_rows = 0;     ///< rows an `issue` took from a prefetch read still in flight (no second read)
     std::vector<float> read_us;   ///< last <= 65,536 read latencies, for percentiles
     double percentile(double q) const;
 };
@@ -71,6 +76,22 @@ public:
 
     /// Block until every row of the ticket is in `out_raw`. Returns false on an I/O error (message in `err`).
     bool collect(Ticket t, std::string& err);
+
+    /// STRATA_PL_PLE_PREFETCH: start reading `n` rows into the ROW CACHE, for an `issue` that will want them
+    /// soon (the pipelined decode knows a window's tokens 0.3-3 ms before it stages them: row 0 at the verdict,
+    /// each draft as the drafter's chain lands it).  No ticket: rows already cached or already being read by an
+    /// earlier prefetch are skipped, the rest go to the SSD behind any ticket's reads and are inserted into the
+    /// cache when they land.  An `issue` that wants a row whose prefetch read is still in flight ATTACHES to that
+    /// read (its ticket completes with it) instead of reading the page again.  The bytes are the table's, so
+    /// whatever is prefetched (a wrong guess included) changes no value; it only spends SSD reads.  Until the first
+    /// call the reader behaves exactly as before.
+    void prefetch(const uint32_t* rows, size_t n);
+
+    /// STRATA_PL_PLE_LATE: non-blocking - every row of the ticket has landed (or the reader failed: `collect`
+    /// then says so), so `collect` returns at once.  With `epoch` (io_thread mode): the reader's completion count
+    /// at the caller's last look; when no ticket has completed since, false without taking the reader's lock (the
+    /// host loop polls this between doorbells, beside the I/O worker that needs the same lock).
+    bool ready(Ticket t, uint64_t* epoch = nullptr);
 
     /// Keep the SSD awake while the table is in use (io_thread mode only; call after `open`): when no read has
     /// gone out for `period_ms`, the worker reads one page of the table, until `window_s` after the last `issue`.

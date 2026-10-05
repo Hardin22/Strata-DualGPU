@@ -195,6 +195,17 @@ public:
     /// expert evicted on the host (the pool then computes it on the CPU) before the device table follows.  Also turns
     /// the device-planned layers (E-6) off.  Before `init`.
     void set_always_publish(bool on) { always_publish_ = on; }
+    /// STRATA_PL_PLE_LATE (stage 0): each pipelined window reads its PLE rows through a ticket of its own
+    /// (PleTable::gather_issue_t, so both verifiers of the stage can have a window staged) instead of the table's
+    /// shared prefetch slots, and `service` never waits for them: when layer 0 has been served before they have
+    /// landed, its flag goes up later, once they have, and the host serves the other windows meanwhile.  `run` and the
+    /// batch windows are unchanged.
+    void set_ple_ticketed(bool on) { ple_tk_ = on; }
+    /// set_ple_ticketed: tickets issued, collected at staging or launch (already landed), collected by `service`,
+    /// dropped (a window staged ahead and never launched); windows whose layer-0 flag waited for the rows, and that
+    /// wait (ms, host side)
+    int64_t ple_tk_issued = 0, ple_tk_now = 0, ple_tk_late = 0, ple_tk_dropped = 0, ple_tk_held = 0;
+    double ms_ple_held = 0;
     cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
@@ -285,7 +296,17 @@ private:
     // pipelined windows (pl_launch ...)
     cudaStream_t ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
     bool always_publish_ = false;
-    void pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]);
+    bool pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
+    // set_ple_ticketed: the ticket of the window staged on this verifier (-1: none outstanding).  h_ple_ is written
+    // only by the collect of the ticket issued for the window staged here: at its staging or launch, or while it runs
+    // but before its layer-0 flag is up (layer 1 copies the rows after that flag).
+    bool ple_tk_ = false;
+    int ple_ticket_ = -1;
+    bool fl_ple_held_ = false;   ///< layer 0 served, its flag held until the window's rows have landed
+    double fl_ple_held_ms_ = 0;
+    /// The outstanding ticket's rows into h_ple_ if they have all landed (never blocks); -1 on an error (`err`), else
+    /// 0 (ple_ticket_ is -1 once they are in).  `late`: polled by `service` (counted apart from staging).
+    int ple_poll(std::string& err, bool late);
     cudaEvent_t ev_done_ = nullptr, ev_commit_ = nullptr;
     unsigned long long* prof_pin_ = nullptr;   ///< pinned host copy of the stamps (pipelined windows)
     bool fl_active_ = false, fl_prof_ = false, fl_ple_ = false, commit_live_ = false, pl_prestaged_ = false;

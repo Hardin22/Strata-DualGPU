@@ -150,6 +150,29 @@ public:
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// STRATA_PL_PLE_LATE: `gather_batch` in two halves with a HANDLE, so several batches can be in flight at once
+    /// (the pipelined decode's two stage-0 verifiers each stage a window ahead of its launch).  Each handle owns its row
+    /// list and raw buffer, apart from `prefetch_rows`' slots.  `gather_issue_t` starts the reads (Direct mode; the
+    /// mapped mode reads in `gather_collect_t`) and returns the handle, -1 on an error (`err`); `gather_ready` never
+    /// blocks; `gather_collect_t` writes `out` (the same bytes as `gather_batch`) and frees the handle; `gather_drop`
+    /// frees one that will never be collected (a window staged ahead and never launched) - its buffer is reused only
+    /// once its reads have landed.
+    int gather_issue_t(const uint32_t* rows, size_t n_tokens, std::string& err);
+    bool gather_ready(int h);
+    bool gather_collect_t(int h, float* out, std::string& err);
+    void gather_drop(int h);
+    /// STRATA_PL_PLE_PREFETCH (Direct mode): start reading the rows of `n` tokens into the reader's row cache - token
+    /// i's 16 rows from its two predecessors, (prev0, prev1) for token 0 then the tokens themselves, as a verify
+    /// window's staging hashes them.  Nothing waits for them; a later request for the same rows finds them cached, or
+    /// waits for their read in flight instead of reading them again.  `consts` null: the artifact's.
+    void prefetch_tokens(const int32_t* toks, int n, int32_t prev0, int32_t prev1, const PleConsts* consts = nullptr);
+    /// The reader's counters (Direct mode; zeros otherwise), for per-request deltas in the decode timing.
+    struct IoCounters {
+        uint64_t requests = 0, cache_hits = 0, attached = 0, reads = 0, prefetch_rows = 0, prefetch_skipped = 0,
+                 prefetch_reads = 0;
+        double wait_us = 0;
+    };
+    IoCounters io_counters() const;
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

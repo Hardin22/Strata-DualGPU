@@ -7,10 +7,12 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/ngram/ple_reader.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #endif
@@ -164,6 +166,27 @@ struct PleTable::Impl {
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) strata::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
         else iq4nl_dequant_row(row, out160);
     }
+    // gather_issue_t / gather_ready / gather_collect_t / gather_drop: the handles (indices).  A deque, so a new handle
+    // never moves the ones whose raw buffers the reader is writing into.
+    struct Batch {
+        bool used = false;      // handed out, until collected or dropped (and, dropped, until its reads have landed)
+        bool dropped = false;
+        strata::ngram::PleReader::Ticket ticket;
+        std::vector<uint32_t> rows;
+        std::vector<uint8_t> raw;
+        uint64_t epoch = ~0ull; // the reader's completion count at the last not-ready look (PleReader::ready)
+    };
+    std::deque<Batch> batches;
+    /// The dropped handles whose reads have all landed are free again.
+    void reap() {
+        for (Batch& b : batches)
+            if (b.used && b.dropped && reader.ready(b.ticket)) {
+                std::string e;
+                (void) reader.collect(b.ticket, e);   // returns at once; releases the reader's ticket
+                b.used = false;
+                b.dropped = false;
+            }
+    }
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -315,6 +338,7 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
 void PleTable::close() {
     wait_prefetches();
     impl_->reader.close();
+    impl_->batches.clear();   // after the reader's close: no read is left writing into them
     impl_->pending = false;
     impl_->locked = false;   // the unmap below releases the lock
     impl_->mode = PleIo::Mmap;
@@ -438,6 +462,97 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     wait_prefetches();
     for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
     return true;
+}
+
+int PleTable::gather_issue_t(const uint32_t* rows, size_t n_tokens, std::string& err) {
+    Impl& m = *impl_;
+    if (m.mode == PleIo::Direct) m.reap();
+    size_t h = 0;
+    while (h < m.batches.size() && m.batches[h].used) ++h;
+    if (h == m.batches.size()) {
+        if (m.batches.size() >= 64) { err = "PleTable::gather_issue_t: 64 batches in flight"; return -1; }
+        m.batches.emplace_back();
+    }
+    Impl::Batch& b = m.batches[h];
+    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    b.used = true;
+    b.dropped = false;
+    b.epoch = ~0ull;
+    b.rows.assign(rows, rows + n);
+    if (m.mode == PleIo::Direct) {
+        b.raw.resize(n * m.rb);
+        b.ticket = m.reader.issue(b.rows.data(), n, b.raw.data());
+    }
+    return (int) h;
+}
+
+bool PleTable::gather_ready(int h) {
+    Impl& m = *impl_;
+    if (h < 0 || (size_t) h >= m.batches.size() || !m.batches[(size_t) h].used || m.mode != PleIo::Direct) return true;
+    Impl::Batch& b = m.batches[(size_t) h];
+    return m.reader.ready(b.ticket, &b.epoch);
+}
+
+bool PleTable::gather_collect_t(int h, float* out, std::string& err) {
+    Impl& m = *impl_;
+    if (h < 0 || (size_t) h >= m.batches.size() || !m.batches[(size_t) h].used || m.batches[(size_t) h].dropped) {
+        err = "PleTable::gather_collect_t: not a batch in flight";
+        return false;
+    }
+    Impl::Batch& b = m.batches[(size_t) h];
+    b.used = false;
+    const size_t n = b.rows.size();
+    if (m.mode == PleIo::Direct) {
+        if (!m.reader.collect(b.ticket, err)) return false;
+        for (size_t i = 0; i < n; ++i) m.decode(b.raw.data() + i * m.rb, out + i * PLE_HEAD_DIM);
+        m.bytes_read += (uint64_t) n * m.rb;
+        return true;
+    }
+    for (size_t i = 0; i < n; ++i) read_row(b.rows[i], out + i * PLE_HEAD_DIM);
+    return true;
+}
+
+void PleTable::gather_drop(int h) {
+    Impl& m = *impl_;
+    if (h < 0 || (size_t) h >= m.batches.size() || !m.batches[(size_t) h].used) return;
+    Impl::Batch& b = m.batches[(size_t) h];
+    if (m.mode != PleIo::Direct) { b.used = false; return; }
+    b.dropped = true;   // its reads may still be writing into `raw`: free once they have landed (`reap`)
+    m.reap();
+}
+
+void PleTable::prefetch_tokens(const int32_t* toks, int n, int32_t prev0, int32_t prev1, const PleConsts* consts) {
+    if (impl_->mode != PleIo::Direct || n <= 0 || !impl_->reader.is_open()) return;
+    static const PleConsts artifact = ple_artifact_consts();
+    const PleConsts& c = consts != nullptr ? *consts : artifact;
+    constexpr int kChunk = 8;
+    uint32_t rows[kChunk * PLE_N_HEADS];
+    int32_t prev[2] = {prev0, prev1};
+    for (int done = 0; done < n;) {
+        const int k = std::min(kChunk, n - done);
+        for (int t = 0; t < k; ++t) {   // as a verify window's staging hashes them, token by token
+            ngram_rows(&toks[done + t], prev, 1, c, rows + t * PLE_N_HEADS);
+            prev[0] = prev[1];
+            prev[1] = toks[done + t];
+        }
+        impl_->reader.prefetch(rows, (size_t) k * PLE_N_HEADS);
+        done += k;
+    }
+}
+
+PleTable::IoCounters PleTable::io_counters() const {
+    IoCounters c;
+    if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return c;
+    const strata::ngram::ReaderStats s = impl_->reader.snapshot();
+    c.requests = s.requests;
+    c.cache_hits = s.cache_hits;
+    c.attached = s.attached_rows;
+    c.reads = s.reads;
+    c.prefetch_rows = s.prefetch_rows;
+    c.prefetch_skipped = s.prefetch_skipped;
+    c.prefetch_reads = s.prefetch_reads;
+    c.wait_us = s.wait_us;
+    return c;
 }
 
 void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }

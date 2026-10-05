@@ -5276,6 +5276,10 @@ int main(int argc, char** argv) {
         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
         // K+1 while stage 1 still reads window K's hand-off
         const bool pipe = o.pipeline_windows > 0 && n_stages == 2 && !split_same && stages.size() == 1;
+        // STRATA_PL_PLE_LATE=1 (default off): stage 0's pipelined windows read their PLE rows through a ticket each
+        // (both verifiers of the stage can have one in flight), and layer 0's flag waits for them instead of the host
+        // thread, which serves the other windows meanwhile (Verifier::set_ple_ticketed)
+        static const bool pl_ple_late = [] { const char* v = std::getenv("STRATA_PL_PLE_LATE"); return v != nullptr && std::atoi(v) != 0; }();
         strata::core::Verifier ver_b;
         SplitDrive split_drive_b;
         cudaStream_t pl_stream[2] = {nullptr, nullptr};
@@ -5289,6 +5293,7 @@ int main(int argc, char** argv) {
             for (strata::core::Verifier* v : {&ver, &ver_b}) {
                 v->set_stream(pl_stream[0]);
                 v->set_always_publish(true);
+                v->set_ple_ticketed(pl_ple_late);
             }
             for (strata::core::Verifier* v : {&stages[0]->ver, &stages[0]->ver_b}) {
                 v->set_stream(pl_stream[1]);
@@ -5470,6 +5475,9 @@ int main(int argc, char** argv) {
                                  "windows%s\n", o.pipeline_windows,
                          pl_snap2[0] == nullptr ? "" : pl_snap_overlap ? " (decode too; the GDN snapshots beside the window)"
                                                                        : " (decode too; the GDN snapshot on the critical path)");
+        if (pipe && pl_ple_late)
+            std::fprintf(stderr, "strata serve: --pipeline-windows: stage 0's PLE rows through a ticket per window, layer 0 "
+                                 "waiting for them instead of the host (STRATA_PL_PLE_LATE)\n");
         // the verifiers by [stage][parity], their pool routing, and the drafter's events (in a pipelined prompt read, a
         // stage-1 window waits until the drafter has read the rows of the same parity's previous window)
         strata::core::Verifier* PV[2][2] = {{&ver, &ver_b}, {pipe ? &stages[0]->ver : nullptr, pipe ? &stages[0]->ver_b : nullptr}};
@@ -7991,6 +7999,69 @@ int main(int argc, char** argv) {
                 int64_t pl_spec = 0, pl_on = 0, pl_undo = 0, pl_gate = 0, pl_fm = 0;
                 std::vector<int32_t> outp(8, 0);
                 bool ending = false;
+                // STRATA_PL_PLE_PREFETCH=1 (default off): the PLE rows a stage-0 window will be staged on are read into
+                // the row cache as soon as each token is known - row 0 at the verdict, each draft as the chain lands it,
+                // a lookup B's tokens once A is launched - so its staging finds them cached (or waits for their read in
+                // flight) instead of starting them.  A wrong guess costs SSD reads only: the rows are the table's own
+                // bytes.  Direct mode only.
+                static const bool pl_ple_pf = [] { const char* v = std::getenv("STRATA_PL_PLE_PREFETCH"); return v != nullptr && std::atoi(v) != 0; }();
+                // STRATA_PL_EARLY_CHAIN=1 (default off): a verdict launches the next chain before it prints and flushes
+                // the tokens, feeds the suffix drafter and the policy and ticks the adaptive tier (the chain needs none
+                // of them)
+                static const bool pl_early_chain = [] { const char* v = std::getenv("STRATA_PL_EARLY_CHAIN"); return v != nullptr && std::atoi(v) != 0; }();
+                strata::kernels::PleTable* const pf_table =
+                    pl_ple_pf && ss.ple.ready() && ss.ple.table->mode() == strata::kernels::PleIo::Direct ? ss.ple.table : nullptr;
+                int32_t pf_seq[16] = {};   // the chain's window: the two tokens before it, then its tokens
+                int32_t pf_def_tok[8] = {}, pf_def_prev[2] = {-1, -1};   // a lookup B's tokens, read ahead after A's launch
+                int pf_def_n = 0;
+                int pf_known = 0;          // of its tokens, how many were known at the chain's launch (staged with it)
+                int pf_upto = 0;           // the chain's outputs looked at
+                int64_t pf_tokens = 0, pl_early_n = 0;
+                // the request's line for these switches (STRATA_DECODE_TIMING with one on): the reader's and the
+                // stage-0 verifiers' counters
+                const bool i2_log = dec_timing && (pf_table != nullptr || pl_early_chain || pl_ple_late);
+                const strata::kernels::PleTable::IoCounters pio0 =
+                    i2_log && ss.ple.ready() ? ss.ple.table->io_counters() : strata::kernels::PleTable::IoCounters{};
+                int64_t tk0[5] = {};
+                double tk0_ms = 0;
+                for (int par = 0; par < 2; ++par) {
+                    tk0[0] += PV[0][par]->ple_tk_issued;
+                    tk0[1] += PV[0][par]->ple_tk_now;
+                    tk0[2] += PV[0][par]->ple_tk_late;
+                    tk0[3] += PV[0][par]->ple_tk_dropped;
+                    tk0[4] += PV[0][par]->ple_tk_held;
+                    tk0_ms += PV[0][par]->ms_ple_held;
+                }
+                // the two tokens before the next position: what the session has consumed (ss.ple_prev follows the
+                // stage-0 commits, which may be speculative or about to be undone here)
+                auto pf_tail = [&](int32_t* two) {
+                    const size_t c = consumed.size();
+                    two[0] = c >= 2 ? consumed[c - 2] : -1;
+                    two[1] = c >= 1 ? consumed[c - 1] : -1;
+                };
+                // a chain was launched over the window whose first `n_known` tokens are `known` (staged, or row 0)
+                auto pf_start = [&](const int32_t* known, int n_known) {
+                    if (pf_table == nullptr) return;
+                    pf_tail(pf_seq);
+                    pf_known = std::max(1, std::min(n_known, 8));
+                    for (int i = 0; i < pf_known; ++i) pf_seq[2 + i] = known[i];
+                    pf_upto = 0;
+                };
+                // the chain's outputs [pf_upto, k): output j is the window's token j + 1 (a fresh chain drafts the
+                // window itself; a forced one is forced through its staged drafts, then guesses the next window)
+                auto pf_chain = [&](int k) {
+                    if (pf_table == nullptr) return;
+                    const int32_t* oc = mtp.chain_tok();
+                    for (; pf_upto < k && pf_upto + 1 < 14; ++pf_upto) {
+                        const int idx = pf_upto + 1;
+                        if (idx < pf_known) continue;      // a forced chain's own drafts: staged with its window
+                        const int32_t t = oc[pf_upto];
+                        if (t < 0) break;
+                        pf_seq[2 + idx] = t;
+                        pf_table->prefetch_tokens(&t, 1, pf_seq[idx], pf_seq[idx + 1], &ss.ple.consts);
+                        ++pf_tokens;
+                    }
+                };
                 A.T = 1;
                 A.p = p;
                 A.tok[0] = x;
@@ -8179,7 +8250,9 @@ int main(int argc, char** argv) {
                     w.sfx = true;
                     w.sfx_match = match;
                     const int rest = k - (w.T - 1);   // lookup tokens past w: B's row 0 (w's bonus guess) and its drafts
+                    bool lookup_b = false;
                     if (&w == &A && rest >= 1 && pl_lookup_pon > 0.0f && !b_done) {
+                        lookup_b = true;
                         B = PW{};
                         B.seq = A.seq + 1;
                         B.p = A.p + A.T;
@@ -8192,6 +8265,23 @@ int main(int argc, char** argv) {
                         b_done = true;   // the chain in flight makes no B for this A
                         tre("CD", A.seq + 1, 3, (int) (1000.0f * B.p_on));
                     }
+                    // STRATA_PL_PLE_PREFETCH: B's lookup tokens, staged at B's launch behind A (a lookup B is never
+                    // prestaged).  Not A's drafts: A is staged right after this and its own staging reads them at the
+                    // same moment.  Issued once A has been launched (pf_def_flush), for the same reason.
+                    if (pf_table != nullptr && lookup_b) {
+                        int32_t two[2];
+                        pf_tail(two);   // the two tokens before A (A.tok[0] is not consumed yet)
+                        pf_def_prev[0] = A.T >= 2 ? A.tok[A.T - 2] : two[1];
+                        pf_def_prev[1] = A.tok[A.T - 1];
+                        pf_def_n = std::min(B.T, 8);
+                        for (int i = 0; i < pf_def_n; ++i) pf_def_tok[i] = B.tok[i];
+                    }
+                };
+                auto pf_def_flush = [&]() {
+                    if (pf_def_n <= 0 || pf_table == nullptr) return;
+                    pf_table->prefetch_tokens(pf_def_tok, pf_def_n, pf_def_prev[0], pf_def_prev[1], &ss.ple.consts);
+                    pf_tokens += pf_def_n;
+                    pf_def_n = 0;
                 };
                 const Clock::time_point pl_t0 = Clock::now();
                 for (int st = 0; st < 2; ++st)
@@ -8271,6 +8361,7 @@ int main(int argc, char** argv) {
                     if (chain_kind != 0) {
                         const int k_ready = mtp.chain_outputs_ready(err);
                         if (k_ready < 0) return die(err);
+                        if (pf_table != nullptr && !b_done && !A.sfx) pf_chain(k_ready);   // STRATA_PL_PLE_PREFETCH
                         if (chain_kind == 2 && !early_used) {
                             // A's size is decided by its first outputs: a draft below spec_min_p ends it (the serial
                             // loop's rule), so A goes to stage 0 as soon as that is known, not after all S_mtp - 1
@@ -8294,6 +8385,7 @@ int main(int argc, char** argv) {
                         const int r = mtp.chain_poll(err);
                         if (r < 0) return die(err);
                         const int k = r == 1 ? chain_n : k_ready;
+                        if (r == 1 && pf_table != nullptr && !b_done && !A.sfx) pf_chain(k);   // the last ones
                         const int32_t* oc = mtp.chain_tok();
                         const float* op = mtp.chain_prob();
                         if (r == 1 && chain_kind == 2 && !early_used) {
@@ -8354,6 +8446,7 @@ int main(int argc, char** argv) {
                         A.launched = true;
                         tre("L0", A.seq, A.T, 0);
                     }
+                    pf_def_flush();   // STRATA_PL_PLE_PREFETCH: a lookup B's rows, now that A is on its way
                     // ---- stage 0: B, speculatively, right behind A
                     if (B.ready && !B.launched && A.finished && !A.committed && !doomed) {
                         if (B.p_on >= theta && B.p + B.T <= o.max_context) {
@@ -8406,6 +8499,51 @@ int main(int argc, char** argv) {
                     ++rounds;
                     ++dec_windows;
                     dec_T += A.T;
+                    // STRATA_PL_EARLY_CHAIN: the chain first.  The request's end is decided as the loop below decides
+                    // it, without printing; the printing, the suffix drafter, the calibration, the policy and the
+                    // adaptive tier follow the launch.  The chain needs none of them (the suffix drafter is read by
+                    // pick_lookup, after its first outputs), and the tier's synchronous uploads (res_upload, on the
+                    // legacy stream) do not wait for it: the drafter's stream is non-blocking.
+                    const bool on_v = B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
+                    bool e_last = false, e_stop = false, e_launched = false;
+                    double e_now = 0.0;
+                    if (pl_early_chain) {
+                        bool e_eos = false;
+                        int n_emit = 0;
+                        for (int i = 0; i <= a && produced_n + n_emit < max_new && !e_eos; ++i) {
+                            ++n_emit;
+                            e_eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
+                        }
+                        e_stop = stop_req.load();
+                        e_last = e_eos || produced_n + n_emit >= max_new || e_stop;
+                        e_now = ms_now();
+                        tre("V", A.seq, a, on_v ? 1 : (B.launched ? -1 : 0));
+                        if (!e_last) {
+                            mtp.set_source_R(V1(A).final_R(0));
+                            if (on_v) {   // the chain over A, forced through B's drafts (as below)
+                                chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
+                                if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
+                                    return die(err);
+                                tre("CL", A.seq, 1);
+                            } else {      // fresh (as below)
+                                chain_n = strata::kernels::kVerifyMaxT - 1;
+                                if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
+                                    return die(err);
+                                tre("CL", A.seq, 2);
+                            }
+                            e_launched = true;
+                            ++pl_early_n;
+                        }
+                    }
+                    // STRATA_PL_PLE_PREFETCH: off the path the next window is fresh and its row 0 is the bonus token
+                    // outp[a], after the tokens just consumed: its rows are read while the chain drafts (else at its
+                    // staging, right before its launch).  After an early chain's launch, which it must not delay.
+                    if (pf_table != nullptr && !on_v) {
+                        int32_t two[2];
+                        pf_tail(two);
+                        pf_table->prefetch_tokens(&outp[(size_t) a], 1, two[0], two[1], &ss.ple.consts);
+                        ++pf_tokens;
+                    }
                     bool eos = false;
                     for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
@@ -8416,8 +8554,10 @@ int main(int argc, char** argv) {
                     }
                     std::fflush(stdout);
                     if (eos) finish = "stop";
-                    else if (stop_req.load()) finish = "cancel";
-                    const bool last = eos || produced_n >= max_new || stop_req.load();
+                    else if (pl_early_chain ? e_stop : stop_req.load()) finish = "cancel";
+                    // (early chain: the decision made before the printing - a stop request arriving in between ends
+                    // the request at the next verdict)
+                    const bool last = pl_early_chain ? e_last : (eos || produced_n >= max_new || stop_req.load());
                     const bool on = B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
@@ -8425,9 +8565,9 @@ int main(int argc, char** argv) {
                         cal_n[bin] += 1;
                         cal_on[bin] += would ? 1 : 0;
                     }
-                    tre("V", A.seq, a, on ? 1 : (B.launched ? -1 : 0));
+                    if (!pl_early_chain) tre("V", A.seq, a, on ? 1 : (B.launched ? -1 : 0));
                     {
-                        const double now = ms_now();
+                        const double now = pl_early_chain ? e_now : ms_now();
                         const int c = A.spec ? 1 : 0;
                         if (A.sfx) { ++sfx_windows; sfx_drafts += A.T - 1; sfx_ok += a; }
                         if (A.seq > 0 && !last) policy.observe(A.sfx, A.T, a, A.sfx_match, now - last_verdict);
@@ -8444,13 +8584,16 @@ int main(int argc, char** argv) {
                     if (!last && !ajob && !pl_adapt()) return die("an adaptive refill failed");
                     if (on && !last) {
                         ++pl_on;
-                        // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
-                        mtp.set_source_R(V1(A).final_R(0));
-                        chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
-                        if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
-                            return die(err);
+                        if (!e_launched) {
+                            // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
+                            mtp.set_source_R(V1(A).final_R(0));
+                            chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
+                            if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
+                                return die(err);
+                            tre("CL", A.seq, 1);
+                        }
+                        pf_start(B.tok, B.T);   // STRATA_PL_PLE_PREFETCH: the chain's window is B (staged)
                         chain_kind = 1;
-                        tre("CL", A.seq, 1);
                         early_used = false;
                         b_done = false;
                         A = B;
@@ -8468,12 +8611,15 @@ int main(int argc, char** argv) {
                         // would finish it, and the other would wait for it forever)
                         B = PW{};
                         if (!last) {
-                            mtp.set_source_R(V1(A).final_R(0));
-                            chain_n = strata::kernels::kVerifyMaxT - 1;
-                            if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
-                                return die(err);
+                            if (!e_launched) {
+                                mtp.set_source_R(V1(A).final_R(0));
+                                chain_n = strata::kernels::kVerifyMaxT - 1;
+                                if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
+                                    return die(err);
+                                tre("CL", A.seq, 2);
+                            }
+                            pf_start(&outp[(size_t) a], 1);   // STRATA_PL_PLE_PREFETCH: row 0 known, the chain drafts the rest
                             chain_kind = 2;
-                            tre("CL", A.seq, 2);
                             early_used = false;
                             b_done = false;
                             PW nA;
@@ -8535,6 +8681,37 @@ int main(int argc, char** argv) {
                             cal += b;
                         }
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
+                }
+                // what STRATA_PL_PLE_PREFETCH / _PLE_LATE / _EARLY_CHAIN did this request.  "window rows": the rows the
+                // stage-0 windows asked the reader for (with the read-ahead on, most should come from the row cache or
+                // attach to a read ahead); "held": windows whose layer-0 flag waited for their rows (the host did not)
+                if (i2_log) {
+                    const strata::kernels::PleTable::IoCounters pio1 =
+                        ss.ple.ready() ? ss.ple.table->io_counters() : strata::kernels::PleTable::IoCounters{};
+                    int64_t tk1[5] = {};
+                    double tk1_ms = 0;
+                    for (int par = 0; par < 2; ++par) {
+                        tk1[0] += PV[0][par]->ple_tk_issued;
+                        tk1[1] += PV[0][par]->ple_tk_now;
+                        tk1[2] += PV[0][par]->ple_tk_late;
+                        tk1[3] += PV[0][par]->ple_tk_dropped;
+                        tk1[4] += PV[0][par]->ple_tk_held;
+                        tk1_ms += PV[0][par]->ms_ple_held;
+                    }
+                    const uint64_t rq = pio1.requests - pio0.requests, rh = pio1.cache_hits - pio0.cache_hits;
+                    std::fprintf(stderr, "strata pipeline ple: read ahead %lld tokens, %llu rows to the SSD (%llu skipped: "
+                                         "cached or in flight), %llu SSD reads | window rows %llu: %.1f%% from the row "
+                                         "cache, %llu attached to a read ahead, reader wait %.3f ms | tickets %lld: %lld in "
+                                         "at staging/launch, %lld by service, %lld dropped; %lld windows held %.3f ms | "
+                                         "early chains %lld\n",
+                                 (long long) pf_tokens, (unsigned long long) (pio1.prefetch_rows - pio0.prefetch_rows),
+                                 (unsigned long long) (pio1.prefetch_skipped - pio0.prefetch_skipped),
+                                 (unsigned long long) (pio1.prefetch_reads - pio0.prefetch_reads), (unsigned long long) rq,
+                                 rq > 0 ? 100.0 * (double) rh / (double) rq : 0.0,
+                                 (unsigned long long) (pio1.attached - pio0.attached), (pio1.wait_us - pio0.wait_us) / 1000.0,
+                                 (long long) (tk1[0] - tk0[0]), (long long) (tk1[1] - tk0[1]), (long long) (tk1[2] - tk0[2]),
+                                 (long long) (tk1[3] - tk0[3]), (long long) (tk1[4] - tk0[4]), tk1_ms - tk0_ms,
+                                 (long long) pl_early_n);
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {

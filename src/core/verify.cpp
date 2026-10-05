@@ -2189,6 +2189,9 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
                     "commit event %s (commit launched %d)\n", name, fl_active_ ? "IN FLIGHT" : "idle", last_t_,
                  (long long) last_pos0_, (long long) fl_k_, (long long) fl_total_, rd(h_seq_), rd(h_flag_), rd(h_flagA_),
                  rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
+    if (ple_tk_)   // STRATA_PL_PLE_LATE: layer 0's flag waits for the window's PLE rows while it is held
+        std::fprintf(f, "  %s: PLE rows: ticket %d outstanding, layer 0 %s\n", name, ple_ticket_,
+                     fl_ple_held_ ? "HELD for them" : "not held");
 }
 
 bool Verifier::capture_all(std::string& err) {
@@ -2214,8 +2217,10 @@ bool Verifier::capture_all(std::string& err) {
 }
 
 // The host staging of a pipelined window: run()'s (stage_inputs), and its PLE rows from `ple_prev` with their pages
-// prefetched (they are gathered into the mapped rows when layer 0 is served, as run() does).
-void Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]) {
+// prefetched (they are gathered into the mapped rows when layer 0 is served, as run() does).  set_ple_ticketed: the
+// rows are read through a ticket of the window's own instead, collected now if they have all landed already (the row
+// cache), else by `service`.
+bool Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
     using namespace strata::kernels;
     stage_inputs(T, tokens, pos0);
     staged_ = false;   // a later run() stages its own window
@@ -2227,11 +2232,37 @@ void Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_
             ngram_rows(&tokens[t], prev, 1, ss.ple.consts, pl_ple_rows_.data() + t * PLE_N_HEADS);
             prev[0] = prev[1];
             prev[1] = tokens[t];
-            ss.ple.table->prefetch_rows(pl_ple_rows_.data() + t * PLE_N_HEADS);
+            if (!ple_tk_) ss.ple.table->prefetch_rows(pl_ple_rows_.data() + t * PLE_N_HEADS);
+        }
+        if (ple_tk_) {
+            if (ple_ticket_ >= 0) {   // a window staged ahead and never launched: those rows are not this window's
+                ss.ple.table->gather_drop(ple_ticket_);
+                ple_ticket_ = -1;
+                ++ple_tk_dropped;
+            }
+            ple_ticket_ = ss.ple.table->gather_issue_t(pl_ple_rows_.data(), (size_t) T, err);
+            if (ple_ticket_ < 0) return false;
+            ++ple_tk_issued;
+            if (ple_poll(err, false) < 0) return false;
         }
     }
     pl_prev_[0] = ple_prev[0];
     pl_prev_[1] = ple_prev[1];
+    return true;
+}
+
+int Verifier::ple_poll(std::string& err, bool late) {
+    if (ple_ticket_ < 0) return 0;
+    SessionState& ss = *ss_;
+    if (!ss.ple.table->gather_ready(ple_ticket_)) return 0;
+    const int h = ple_ticket_;
+    ple_ticket_ = -1;
+    const bool ok = ss.ple.table->gather_collect_t(h, h_ple_, err);   // returns at once: every row has landed
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    if (late) ++ple_tk_late;
+    else ++ple_tk_now;
+    return ok ? 0 : -1;
 }
 
 bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
@@ -2239,7 +2270,7 @@ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (pl_ple_rows_.empty()) { err = "verify: pipelined window not prepared (capture_all)"; return false; }
     const Clock::time_point t0 = Clock::now();
-    pl_stage(T, tokens, pos0, ple_prev);
+    if (!pl_stage(T, tokens, pos0, ple_prev, err)) return false;
     pl_prestaged_ = true;
     ms_host += ms_since(t0);
     return true;
@@ -2263,7 +2294,10 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (staged && ss.ple.ready() && ple_stage())
         staged = pl_prev_[0] == ss.ple_prev[0] && pl_prev_[1] == ss.ple_prev[1];
     pl_prestaged_ = false;
-    if (!staged) pl_stage(T, tokens, pos0, ss.ple_prev);
+    if (!staged && !pl_stage(T, tokens, pos0, ss.ple_prev, err)) return false;
+    // set_ple_ticketed: a window staged ahead issued its rows then; they have usually landed by now
+    if (ple_ticket_ >= 0 && ple_poll(err, false) < 0) return false;
+    fl_ple_held_ = false;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     fl_T_ = T;
     fl_k_ = 0;
@@ -2301,8 +2335,20 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         ms_host += ms_since(tp);
         return true;
     };
+    // set_ple_ticketed: 1 = the window's rows are in h_ple_ (or it has none), 0 = not landed yet, -1 = an error.
+    // Never blocks: this thread serves the stage's other window and the other stage too.
+    auto ple_in = [&]() -> int {
+        if (!fl_ple_) return 1;
+        if (ple_ticket_ >= 0 && ple_poll(err, true) < 0) return -1;
+        return ple_ticket_ < 0 ? 1 : 0;
+    };
     if (all_resident_) {   // the zero-doorbell graph never rings: it waits only for flag 1 (stage 0's PLE rows)
-        if (!gather_ple()) return -1;
+        if (ple_tk_) {
+            const int r = ple_in();
+            if (r <= 0) return r;
+        } else if (!gather_ple()) {
+            return -1;
+        }
         *(volatile uint32_t*) h_flag_ = 1;
         fl_k_ = fl_total_;
         progress_tick();
@@ -2313,6 +2359,25 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
     while (fl_k_ < fl_total_) {
         const int64_t l = lb_ + fl_k_ / G;
         const uint32_t want = (uint32_t) (fl_k_ + 1);
+        if (fl_ple_held_) {   // set_ple_ticketed: layer 0 is served, its flag waits for the window's PLE rows
+            const int r = ple_in();
+            if (r < 0) return -1;
+            if (r == 0) {
+                if (now_ms() - fl_ple_held_ms_ > 20000.0) {   // #267: no spin kernel may outlive the engine
+                    trace_ev("TIMEOUT", fl_k_, l, 0);
+                    err = "verify: the PLE rows of layer " + std::to_string(l) + " never landed" +
+                          released_note(release_gpu_waits(5000));
+                    return -1;
+                }
+                return 0;
+            }
+            fl_ple_held_ = false;
+            ms_ple_held += now_ms() - fl_ple_held_ms_;
+            *(volatile uint32_t*) h_flag_ = want;
+            ++fl_k_;
+            fl_since_ms_ = fl_flush_ms_ = now_ms();
+            continue;
+        }
         if (*(volatile uint32_t*) h_seq_ < want) {
             const double now = now_ms();
             if (now - fl_flush_ms_ > 2.0) {   // flush WDDM and notice a dead graph, as run() does
@@ -2358,7 +2423,19 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
-        if (fl_k_ == 0 && !gather_ple()) return -1;
+        if (fl_k_ == 0 && ple_tk_) {
+            const int r = ple_in();
+            if (r < 0) return -1;
+            if (r == 0) {   // layer 0's flag goes up once the rows are in (the next calls), the host free meanwhile
+                fl_ple_held_ = true;
+                fl_ple_held_ms_ = now_ms();
+                ++ple_tk_held;
+                ms_pool += ms_since(b);
+                return 0;
+            }
+        } else if (fl_k_ == 0 && !gather_ple()) {
+            return -1;
+        }
         *(volatile uint32_t*) h_flag_ = want;
         ++fl_k_;
         ms_pool += ms_since(b);
@@ -2446,6 +2523,10 @@ void Verifier::absorb_stats(Verifier& o) {
     windows += o.windows;
     o.ms_wait = o.ms_pool = o.ms_host = o.ms_commit = 0;
     o.windows = 0;
+    ple_tk_issued += o.ple_tk_issued; ple_tk_now += o.ple_tk_now; ple_tk_late += o.ple_tk_late;
+    ple_tk_dropped += o.ple_tk_dropped; ple_tk_held += o.ple_tk_held; ms_ple_held += o.ms_ple_held;
+    o.ple_tk_issued = o.ple_tk_now = o.ple_tk_late = o.ple_tk_dropped = o.ple_tk_held = 0;
+    o.ms_ple_held = 0;
     for (int k = 0; k < 2; ++k)
         for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
     prof_windows_ += o.prof_windows_;
