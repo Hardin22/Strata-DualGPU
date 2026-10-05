@@ -4702,19 +4702,26 @@ int main(int argc, char** argv) {
     // --adapt-async (opt-in): where the asynchronous adaptive tier does not apply, the blocking tier runs, said once.
     // It exchanges experts between the GPU caches and the resident RAM copy only (the copy is checked once it is
     // built, below).  Not beside the --batch slots (their windows run between a request's prompt chunks), a peer
-    // tier or the helper GPUs' tier, which pick their swaps from the same table.  (A pipelined decode loop that
-    // adapts beside windows in flight needs the blocking tier too: such a mode belongs on this list.)
+    // tier or the helper GPUs' tier, which pick their swaps from the same table.  The pipelined decode loop
+    // (--pipeline-windows 2) has windows in flight at every tick: there the steps that overwrite something a window
+    // may still read wait for those windows (see adapt_tick); STRATA_PIPELINE_ADAPT_ASYNC=0 keeps the blocking tier
+    // beside it instead.
     auto adapt_async_off = [&](const char* why) {
         std::fprintf(stderr, "strata generate: --adapt-async 1 is off (%s): the blocking adaptive tier\n", why);
         o.adapt_async = 0;
     };
     if (o.adapt_async) {
+        static const bool pl_async = [] {
+            const char* v = std::getenv("STRATA_PIPELINE_ADAPT_ASYNC");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
         const char* why = !o.serve ? "it needs --serve"
                         : o.adapt_every <= 0 || o.adapt_swaps <= 0 ? "the adaptive tier is off"
                         : !o.resident_cpu_experts ? "it needs the resident RAM mode, --resident-experts"
                         : o.batch > 0 ? "not with --batch slots"
                         : peer.valid() ? "not with --peer-device"
                         : remote_opt ? "not with --remote-expert-opt"
+                        : o.pipeline_windows >= 2 && !pl_async ? "not with --pipeline-windows 2 (STRATA_PIPELINE_ADAPT_ASYNC=0)"
                         : nullptr;
         if (why != nullptr) adapt_async_off(why);
     }
@@ -5488,6 +5495,7 @@ int main(int argc, char** argv) {
         // INVARIANT: nothing pipelined is in flight outside read_windows_pl and the pipelined decode loop - both end
         // here (a checkpoint, a park, the next request and the serial paths all find both stages and the drafter idle).
         // Every window in flight is served to its end (its picks discarded), then both stages and the drafter idle.
+        // (--adapt-async: the decode loop then takes its fences off the asynchronous tier's round, see its end.)
         auto pl_drain = [&]() {
             std::string e2;
             for (int round = 0; round < 10000000; ++round) {
@@ -5949,15 +5957,32 @@ int main(int argc, char** argv) {
         // round drained (adapt_tick(true)), before its prompt lends any slot.  Not bit-exact run to run: which window
         // first computes a swapped-in expert on the GPU (which rounds differently from the CPU) depends on when its
         // copy lands.  `j`: the swap's exchange buffer (its copy back) and bounce buffer (a_cap + j).
+        // --pipeline-windows 2: the pipelined decode loop ticks once per verdict, with work still in flight on both
+        // cards (window K+1 on the first while the last verifies or commits K, each window with its own verifier), and
+        // every layer of a window is planned from the residency table as it is when that layer is served.  So there
+        // two steps also wait for every window both stages' streams hold when the step starts (a_fence_record /
+        // a_fence_passed, set by that loop alone; unset, nothing is in flight at a tick):
+        //   - step 2's copies into the evicted slots: a window planned before may still read the old expert from its
+        //     slot.  The fence is recorded with the evicted experts non-resident, and the job waits for it on the host
+        //     before it copies (a device-side wait would queue the copies behind windows that need this thread);
+        //   - step 3's RAM moves (AState::RamFence): a window planned before may still pull an incoming expert over
+        //     PCIe from the RAM place its evicted one takes.  The fence is recorded with the new experts resident, and
+        //     the moves start at the first tick that finds it passed.
+        // The CPU's reads need no fence: the pool runs inside the loop's service calls, so they are over at a tick.
         struct ASwap { int32_t layer, in, out, slot; int home; int64_t j; bool exchange; };
         struct AHome { strata::core::ExpertCache* cache; cudaStream_t stream; cudaEvent_t ev; int dev; bool used; };
-        enum class AState { Idle, CopyBack, SwapIn, Commit };
+        enum class AState { Idle, CopyBack, SwapIn, RamFence, Commit };
         AState astate = AState::Idle;
         std::vector<ASwap> aswaps;
         std::vector<float> a_usage;
         std::vector<int32_t> a_res;
         int64_t a_win = 0, a_last = 0, a_rounds = 0, a_swapped = 0;
         std::atomic<bool> a_err{false};
+        // the pipelined loop's fences: k = 0 the slots' (step 2), k = 1 the RAM's (step 3).  `a_fence_abort`: the loop
+        // is ending on an error, a job waiting for a fence gives up
+        std::function<void(int)> a_fence_record;
+        std::function<bool(int)> a_fence_passed;
+        std::atomic<bool> a_fence_abort{false};
         std::vector<AHome> ahomes;   // [0] = CUDA0's cache, [k] = layer split stage k's
         std::unique_ptr<JobThread> ajob;
         const int64_t a_cap = std::min<int64_t>(o.adapt_swaps, 96);   // as the blocking tier's exchange buffers
@@ -6103,7 +6128,18 @@ int main(int argc, char** argv) {
                     }
                     aswaps.resize(k);
                     res_upload();
-                    ajob->post(a_copy_in);
+                    if (a_fence_record && !aswaps.empty()) {   // --pipeline-windows 2: the slots' fence (see above)
+                        a_fence_record(0);
+                        ajob->post([&] {
+                            while (!a_fence_passed(0)) {
+                                if (a_fence_abort.load()) { a_err = true; return; }
+                                std::this_thread::yield();
+                            }
+                            a_copy_in();
+                        });
+                    } else {
+                        ajob->post(a_copy_in);
+                    }
                     astate = AState::SwapIn;
                     if (!drain) return true;
                     continue;
@@ -6117,6 +6153,21 @@ int main(int argc, char** argv) {
                     }
                     res_upload();
                     a_swapped += (int64_t) aswaps.size();
+                    if (a_fence_record &&
+                        std::any_of(aswaps.begin(), aswaps.end(), [](const ASwap& w) { return w.exchange; })) {
+                        a_fence_record(1);   // --pipeline-windows 2: the RAM's fence (see above)
+                        astate = AState::RamFence;
+                        continue;
+                    }
+                    ajob->post([&] { src.commit_copies(); });
+                    astate = AState::Commit;
+                    if (!drain) return true;
+                    continue;
+                case AState::RamFence:   // (--pipeline-windows 2) step 3's RAM moves, once its fence has passed
+                    if (a_fence_passed && !a_fence_passed(1)) {
+                        if (!drain) return true;
+                        while (!a_fence_passed(1)) std::this_thread::yield();
+                    }
                     ajob->post([&] { src.commit_copies(); });
                     astate = AState::Commit;
                     if (!drain) return true;
@@ -7852,17 +7903,25 @@ int main(int argc, char** argv) {
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 // the adaptive tier beside the pipeline: the serial loop's rule and adapt() on a thread of its own (its
-                // copies wait for the windows in flight, which this loop keeps serving meanwhile)
+                // copies wait for the windows in flight, which this loop keeps serving meanwhile).  --adapt-async: the
+                // asynchronous tier's steps instead, one tick per verdict, fenced (a_fence_record, below)
                 std::thread pl_adapt_thr;
                 std::atomic<bool> pl_adapt_done{true};
                 bool pl_adapt_ok = true;
                 // an error ends the engine, as the serial loop's do: every GPU wait is released first (#267), so no
-                // window in flight keeps spinning on a flag nobody raises, and the tier's thread can finish
+                // window in flight keeps spinning on a flag nobody raises, and the tier's thread can finish (and the
+                // asynchronous tier's job, which may wait on a fence, gives up: its fences go with this scope)
                 auto die = [&](const std::string& m) -> int {
                     std::fprintf(stderr, "strata serve: pipelined decode: %s\n", m.c_str());
                     strata::core::diag_pipeline_fn().store(nullptr);
                     strata::core::release_gpu_waits(stderr);
                     if (pl_adapt_thr.joinable()) pl_adapt_thr.join();
+                    if (ajob) {
+                        a_fence_abort = true;
+                        ajob->wait();
+                        a_fence_record = nullptr;
+                        a_fence_passed = nullptr;
+                    }
                     std::printf("ERR %s\n", m.c_str());
                     std::fflush(stdout);
                     return 1;
@@ -7983,7 +8042,15 @@ int main(int argc, char** argv) {
                     stage_record(exch_ev);
                     exch_wait = true;
                 };
+                // --adapt-async: the asynchronous tier's fences (see adapt_tick), on the same events: the slots' on
+                // fence_ev, the RAM's on exch_ev (the blocking tier, which uses them above, does not run beside it)
+                if (ajob) {
+                    a_fence_abort = false;
+                    a_fence_record = [&](int k) { stage_record(k == 0 ? fence_ev : exch_ev); };
+                    a_fence_passed = [&](int k) { return stage_passed(k == 0 ? fence_ev : exch_ev); };
+                }
                 auto pl_adapt = [&]() -> bool {
+                    if (ajob) return adapt_tick(false);   // --adapt-async: a step per verdict when it can
                     if (pl_adapt_thr.joinable() && pl_adapt_done.load()) {
                         pl_adapt_thr.join();
                         if (!pl_adapt_ok) return false;
@@ -8322,6 +8389,14 @@ int main(int argc, char** argv) {
                 if (pl_adapt_thr.joinable()) pl_adapt_thr.join();   // its copies waited only for finished work
                 adapt_fence = nullptr;
                 if (exch_wait) pl_release();   // every window has completed (drained)
+                // --adapt-async: a job may still wait on the slots' fence (passed now: drained).  From here the round
+                // in flight needs no fences (the INVARIANT at pl_drain: a checkpoint, a park, the serial loop and the
+                // next request find nothing pipelined in flight); it moves on at the next tick, the next request's drain
+                if (ajob) {
+                    ajob->wait();
+                    a_fence_record = nullptr;
+                    a_fence_passed = nullptr;
+                }
                 for (cudaEvent_t ev : fence_ev) if (ev) cudaEventDestroy(ev);
                 for (cudaEvent_t ev : exch_ev) if (ev) cudaEventDestroy(ev);
                 if (pl_trace_path != nullptr && !pl_trace.empty()) {
