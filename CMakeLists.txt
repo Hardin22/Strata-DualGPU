@@ -350,6 +350,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
     set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # STRATA_ATTN_MERGE_V2: the decode attention's merge bounded by the selection width, against the original on the
+  # same chunk partials, bitwise, over the four KV formats (GPU, synthetic, no model, ~260 MB of VRAM; --bench adds
+  # each merge's time per call at the drafter's shape)
+  if(STRATA_BUILD_TESTS)
+    add_executable(attn_merge_parity src/kernels/attn_merge_parity.cpp)
+    target_include_directories(attn_merge_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(attn_merge_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME attn_merge_parity COMMAND attn_merge_parity)
+    set_tests_properties(attn_merge_parity PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
   # 262144-cell capacity (the top-k dispatch follows the capacity) and exits non-zero on a failed gate

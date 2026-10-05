@@ -43,4 +43,13 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
+/// For src/kernels/attn_merge_parity.cpp only: qsa_decode_attn_batch's two passes apart.  `chunks_only` runs its chunk
+/// pass into `scratch`; `merge_only` merges those partials with the kernel `v2` names (0: attn_merge_kernel, 1:
+/// attn_merge_v2_kernel, the one STRATA_ATTN_MERGE_V2 picks, on by default on NVIDIA), whatever the environment says,
+/// so one chunk pass can be merged by both and the outputs compared bit for bit.
+void qsa_decode_attn_chunks_only(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                 int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, void* stream);
+void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
+                                float* attn, int64_t n_q, int v2, void* stream);
+
 }  // namespace strata::kernels

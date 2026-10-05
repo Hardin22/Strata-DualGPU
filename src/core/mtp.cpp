@@ -225,8 +225,28 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
     const bool kv_hybrid_was = qsa_kv_hybrid();
     const bool kv_int8_was = qsa_kv_int8();
+    const bool kv_q4_was = qsa_kv_q4();
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
+    // STRATA_MTP_KV=q4|int8|f16 (opt-in): the draft layer's own K/V format; unset, it follows the main layers' as
+    // before.  Under --kv q4_0 the drafter's rotated 4-bit K/V costs draft acceptance, and only the drafts change, never
+    // the verified output: every drafter path reads st_'s own format (the K/V append and attention below, the prompt
+    // path's draft-layer batch, the conversation snapshot's format check).  It is one layer of K/V on the drafter's card,
+    // taken before `--expert-cache auto` sizes the slots: fully resident at --max-context 163840, q4_0 90 MiB, int8 165,
+    // f16 320.
+    std::string mtp_kv;   // "" = the main layers' format
+    if (const char* kv = std::getenv("STRATA_MTP_KV"); kv != nullptr && *kv != '\0') {
+        const std::string want(kv);
+        if (want == "q4" || want == "q4_0") mtp_kv = "q4";
+        else if (want == "int8" || want == "q8") mtp_kv = "int8";
+        else if (want == "f16" || want == "fp16") mtp_kv = "f16";
+        else std::fprintf(stderr, "strata mtp: STRATA_MTP_KV=%s is not q4, int8 or f16; the draft layer keeps the main "
+                                  "layers' K/V format\n", kv);
+    }
+    if (!mtp_kv.empty()) {
+        qsa_set_kv_q4(mtp_kv == "q4");
+        qsa_set_kv_int8(mtp_kv == "int8");
+    }
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
@@ -241,7 +261,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
     }
     qsa_set_kv_int8(kv_int8_was);
+    qsa_set_kv_q4(kv_q4_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
+    if (!mtp_kv.empty())
+        std::fprintf(stderr, "strata mtp: draft layer K/V format %s (STRATA_MTP_KV=%s; main layers %s), rotated %d, %s, "
+                             "state %.1f MiB of VRAM\n", st_.kv_q4 ? "q4_0" : (st_.kv_int8 ? "int8" : "f16"), mtp_kv.c_str(),
+                     kv_hybrid_was ? "k8v4" : (kv_q4_was ? "q4_0" : (kv_int8_was ? "int8" : "f16")), st_.kv_rot ? 1 : 0,
+                     st_.kv_mode == 2 ? "a window ring over pinned RAM"
+                                      : (st_.kv_mode == 1 ? "streamed over pinned RAM (--kv-resident)" : "fully resident"),
+                     (double) sb / 1048576.0);
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;
