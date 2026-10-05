@@ -496,13 +496,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: event create failed";
         return false;
     }
-    {   // STRATA_DF_BRANCH (CUDA: default on; HIP: STRATA_DF_BRANCH=1, not measured there); 0: one stream, as before
+    {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
+        // stage's window with the branches stopped inside its graph when an NVML query (nvidia-smi) came between
+        // requests (2x RTX 3090 and 2x RTX 2080 Ti, #905); never seen on Windows.  0 / unset: one stream, as before
         const char* v = std::getenv("STRATA_DF_BRANCH");
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
         df_branch_ = v != nullptr && std::atoi(v) != 0;
-#else
-        df_branch_ = v == nullptr || std::atoi(v) != 0;
-#endif
         if (df_branch_ && df_fork_ == nullptr) {
             bool okb = cudaEventCreateWithFlags(&df_fork_, cudaEventDisableTiming) == cudaSuccess;
             for (int i = 0; i < 2 && okb; ++i)
