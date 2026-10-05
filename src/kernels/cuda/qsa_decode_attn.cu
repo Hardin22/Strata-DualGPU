@@ -496,15 +496,11 @@ __global__ void __launch_bounds__(HD) attn_merge_v2_kernel(const float* __restri
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
-// STRATA_ATTN_MERGE_V2: 1 merges with attn_merge_v2_kernel, 0 with attn_merge_kernel.  On by default on NVIDIA, where
-// attn_merge_parity checks the two; opt-in on AMD until it has run there.
+// STRATA_ATTN_MERGE_V2: 1 merges with attn_merge_v2_kernel, 0 (default) with attn_merge_kernel.  Opt-in: the output is
+// bitwise the same (attn_merge_parity), but its end-to-end gain has not been measured apart from the other switches.
 int attn_merge_v2() {
     static const int on = [] {
-#if defined(__HIPCC__)
         int r = 0;
-#else
-        int r = 1;
-#endif
         const char* v = std::getenv("STRATA_ATTN_MERGE_V2");
         if (v != nullptr && *v != '\0') r = std::atoi(v) != 0 ? 1 : 0;
         return r;
