@@ -25,6 +25,7 @@
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -566,6 +567,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     if (!batch_rec_) groups_[T] = G;
+    // Programmatic dependent launch (pdl.hpp; sm_90+, STRATA_DF_PDL=0: off): the window's quantizations and dense
+    // projections may start while the kernel before them finishes, loading their weights before they wait for its
+    // output.  Only a launch whose predecessors in the graph are all kernels gets programmatic edges; every value is
+    // the same as without them.
+    struct PdlScope {
+        bool prev;
+        explicit PdlScope(bool on) : prev(pdl_scope()) { pdl_scope() = on; }
+        ~PdlScope() { pdl_scope() = prev; }
+    } pdl_window(G == 1 && pdl_supported());
     const int64_t nQall = g.n_qsa_layers();
     // a batch window: row t is slot t, whose state lives in its own session
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
@@ -823,12 +833,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 9, grp);
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
-                if (qb) {
-                    if (cudaMemcpy2DAsync(qcur_ + tb * NH * HD, (size_t) HD * 4, qfull_ + tb * NH * 2 * HD, (size_t) HD * 2 * 4,
-                                          (size_t) HD * 4, (size_t) (n * NH), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
-                        err = "verify: the q/gate split failed";
-                        return false;
-                    }
+                if (qb) {   // the q/gate split as a copy kernel: the window's chain stays kernel to kernel
+                    copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD, cs);
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
@@ -1247,6 +1253,33 @@ bool Verifier::capture(int T, std::string& err) {
         std::fprintf(stderr, "strata verify: the %d-token window graph has %zu nodes:", T, nn);
         for (size_t i = 0; i < v.size() && i < 40; ++i) std::fprintf(stderr, " %d x %.60s;", v[i].first, v[i].second.c_str());
         std::fprintf(stderr, "\n");
+#if CUDART_VERSION >= 12030   // the programmatic (PDL) edges: CUDA allows them only from a kernel node to a kernel node
+        size_t ne = 0;
+#if CUDART_VERSION >= 13000
+        cudaGraphGetEdges(graph, nullptr, nullptr, nullptr, &ne);
+#else
+        cudaGraphGetEdges_v2(graph, nullptr, nullptr, nullptr, &ne);
+#endif
+        std::vector<cudaGraphNode_t> from(ne), to(ne);
+        std::vector<cudaGraphEdgeData> ed(ne);
+#if CUDART_VERSION >= 13000
+        const cudaError_t ge = cudaGraphGetEdges(graph, from.data(), to.data(), ed.data(), &ne);
+#else
+        const cudaError_t ge = cudaGraphGetEdges_v2(graph, from.data(), to.data(), ed.data(), &ne);
+#endif
+        size_t prog = 0, bad = 0;
+        for (size_t i = 0; ge == cudaSuccess && i < ne; ++i) {
+            if (ed[i].type != cudaGraphDependencyTypeProgrammatic) continue;
+            ++prog;
+            cudaGraphNodeType ta, tb2;
+            if (cudaGraphNodeGetType(from[i], &ta) != cudaSuccess || cudaGraphNodeGetType(to[i], &tb2) != cudaSuccess ||
+                ta != cudaGraphNodeTypeKernel || tb2 != cudaGraphNodeTypeKernel)
+                ++bad;
+        }
+        if (ge != cudaSuccess) cudaGetLastError();
+        std::fprintf(stderr, "strata verify: %zu edges, %zu programmatic (PDL), %zu of them not kernel to kernel%s\n", ne,
+                     prog, bad, ge != cudaSuccess ? " (the edge query failed)" : "");
+#endif
     }
 #endif
     const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);

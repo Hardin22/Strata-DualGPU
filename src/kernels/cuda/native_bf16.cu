@@ -1,5 +1,6 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
 #include <limits>
@@ -74,8 +75,8 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
 // token keeps its own accumulator with exactly the single-row kernel's order (pairs, two ordered FMAs, the same warp
 // and block reductions), so each output is bit-identical to a bf16_f32_mmvf_kernel launch of its own.
 template <int BLOCK_SIZE, int NT>
-__global__ void bf16_f32_mmvf_multi_kernel(const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w,
-                                          float* __restrict__ y, int64_t ldy, int n_in, int n_tok) {
+__global__ void bf16_f32_mmvf_multi_kernel(const float* STRATA_PDL_RESTRICT x, int64_t ldx, const uint16_t* __restrict__ w,
+                                          float* STRATA_PDL_RESTRICT y, int64_t ldy, int n_in, int n_tok) {
     const int t = threadIdx.x;
     const uint16_t* row = w + (size_t) blockIdx.x * n_in;
     const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
@@ -89,8 +90,18 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* __restrict__ x, int64_t 
     float acc[NT];
 #pragma unroll
     for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
-    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
-        const uint32_t weight = weights2[pair];
+    // PDL (pdl.hpp): this thread's first PRE weight pairs are loaded before waiting for the activations
+    constexpr int PRE = kPdlPrefetch ? 8 : 0;
+    uint32_t wpre[PRE > 0 ? PRE : 1];
+#pragma unroll
+    for (int q = 0; q < PRE; ++q) {
+        const int pair = t + q * BLOCK_SIZE;
+        wpre[q] = pair < n_in / 2 ? weights2[pair] : 0u;
+    }
+    pdl_wait();
+    int q = 0;
+    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE, ++q) {
+        const uint32_t weight = q < PRE ? wpre[q] : weights2[pair];
         const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
 #pragma unroll
         for (int k = 0; k < NT; ++k) {
@@ -141,8 +152,8 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
     const cudaStream_t st = (cudaStream_t) stream;
 #define STRATA_MMVF_M(N) case N: \
-    if (n_tok <= 4) bf16_f32_mmvf_multi_kernel<N, 4><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); \
-    else bf16_f32_mmvf_multi_kernel<N, 8><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break
+    if (n_tok <= 4) launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); \
+    else launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break
     switch (mmvf_block_size(n_in)) {
         STRATA_MMVF_M(32); STRATA_MMVF_M(64); STRATA_MMVF_M(96); STRATA_MMVF_M(128);
         STRATA_MMVF_M(160); STRATA_MMVF_M(192); STRATA_MMVF_M(224); STRATA_MMVF_M(256);

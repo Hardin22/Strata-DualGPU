@@ -645,6 +645,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       set_tests_properties(mmvq_multi_parity_cuda_layout PROPERTIES ENVIRONMENT "STRATA_MMVQ_WAVE=0")
     endif()
   endif()
+  # programmatic dependent launch (pdl.hpp) in a captured verify-shaped chain: bitwise vs ordinary launches over
+  # replays with poisoned buffers, and only kernel-to-kernel programmatic edges (GPU, synthetic, no model; the edges
+  # are only made on sm_90+, elsewhere it checks that there are none).  NVIDIA only: PDL is a CUDA feature.
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+    add_executable(pdl_parity src/kernels/pdl_parity.cpp)
+    target_include_directories(pdl_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(pdl_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME pdl_parity COMMAND pdl_parity)
+  endif()
   # the IQ kernels that decode a weight part once for every column/entry, bitwise vs the per-column ones
   # (GPU, synthetic, no model; --bench adds old/new timings)
   add_executable(iq_multi_parity src/kernels/iq_multi_parity.cpp)
