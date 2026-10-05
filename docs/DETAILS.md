@@ -136,6 +136,10 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
   as far as the RAM allows, their experts are kept in RAM too (so a prompt reads nothing from the SSD either).
 - The cache still follows the conversation (`--adapt-every`): a swap copies the evicted expert back from VRAM into the
   RAM place of the one that replaces it, so the RAM copy keeps holding exactly what the GPU does not.
+- `--adapt-async 1` (opt-in, `--serve`): the swaps of a round advance between decode windows on a helper thread
+  (copy back, copy in, move into RAM) instead of one window waiting for the whole round. Not with `--batch` or
+  `--peer-device` (the blocking tier runs there). It is not bit-exact from run to run: which window first computes a
+  swapped-in expert on the GPU (which rounds differently from the CPU) depends on when its copy lands.
 - The answers are the plain mapped mode's for the same expert placement: the bytes are the file's. With a page-locked
   copy the GPU also takes its usual share of the misses over PCIe (`--pcie-frac`), as with enough RAM; `--pcie-frac 0`
   (or `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens.

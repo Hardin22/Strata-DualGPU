@@ -488,6 +488,14 @@ public:
     void prepare_overrides() { if (override_.empty()) override_.assign((size_t) blobs_, nullptr); }
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
     int64_t commit_exchanges();
+    /// `commit_exchanges` in two halves, for the asynchronous adaptive tier (--adapt-async): `commit_copies` moves
+    /// every staged evicted blob into its `in`'s place in the copy (on another thread: safe once nothing computes `in`
+    /// from RAM - it is resident on the GPU - while `out` is still read from its exchange buffer), then `commit_flip`
+    /// (the caller's thread, between windows) points `out` there and drops the staging.  Returns how many were applied.
+    void commit_copies();
+    int64_t commit_flip();
+    /// The compact copy's blob of `(layer, expert)`, or null; not counted as a read (any thread).
+    const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
     int64_t exchanges() const { return exchanges_; }
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
     /// the SSD).  0 in a steady resident mode; lend-region experts that did not fit the RAM count here.
