@@ -597,7 +597,9 @@ __global__ void l2_prefetch_kernel(L2Regions r, int evict_last) {
             if (evict_last) asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(base + off));
             else
 #endif
+#if !defined(__HIPCC__)
             asm volatile("prefetch.global.L2 [%0];" ::"l"(base + off));
+#endif
         }
     }
 }
@@ -637,7 +639,11 @@ bool pdl_supported() {
         const char* v = std::getenv("STRATA_DF_PDL");
         int cc = 0;
         cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, dev);
+#if defined(__HIPCC__) || defined(STRATA_USE_HIP)
+        cached[dev] = false;
+#else
         cached[dev] = (v == nullptr || std::atoi(v) != 0) && cc >= 9;   // sm_90+; STRATA_DF_PDL=0: off
+#endif
         init[dev] = true;
     }
     return cached[dev] != 0;
@@ -658,6 +664,15 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
 // bytes, in one launch) and then *flag = 1: every block fences its stores system-wide before it counts itself done,
 // and the last block raises the flag, so a reader that sees the flag sees the hand-off (the next stage's graph waits
 // for it on its own device, wait_flag_ge).  `counter` (device) is back at 0 when the kernel ends.
+
+#if defined(__HIPCC__)
+template <typename T>
+__device__ __forceinline__ T strata_ldcv(const T* p) { return *p; }
+#else
+template <typename T>
+__device__ __forceinline__ T strata_ldcv(const T* p) { return __ldcv(p); }
+#endif
+
 namespace {
 __global__ void handoff_publish_kernel(const float4* __restrict__ R, const float4* __restrict__ bo,
                                        const float4* __restrict__ inj, int T, int hcn4, int n4, int hc4,
@@ -690,7 +705,7 @@ __global__ void handoff_take_kernel(const float4* hand, int hb4, int T, int hcn4
     const int total = T * per;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
         const int t = i / per, w = i - t * per;
-        const float4 v = __ldcv(hand + (size_t) t * hb4 + w);   // mapped memory another GPU wrote: no cached copy
+        const float4 v = strata_ldcv(hand + (size_t) t * hb4 + w);   // mapped memory another GPU wrote: no cached copy
         if (w < hcn4) R[(size_t) t * hcn4 + w] = v;
         else if (w < hcn4 + n4) bo[(size_t) t * n4 + (w - hcn4)] = v;
         else inj[(size_t) t * hc4 + (w - hcn4 - n4)] = v;

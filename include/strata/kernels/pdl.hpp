@@ -57,6 +57,17 @@ inline cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, s
     cfg.numAttrs = 1;
     return cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
 }
-#endif  // __CUDACC__
+#elif defined(__HIPCC__)
+__device__ __forceinline__ void pdl_wait() {}
+
+__device__ __forceinline__ void pdl_trigger() {}
+
+template <typename... KArgs, typename... Args>
+inline hipError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, hipStream_t stream,
+                             Args&&... args) {
+    kernel<<<grid, block, smem, stream>>>(std::forward<Args>(args)...);
+    return hipGetLastError();
+}
+#endif  // __CUDACC__ / __HIPCC__
 
 }  // namespace strata::kernels
