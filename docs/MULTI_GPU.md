@@ -223,6 +223,10 @@ Two cards, exactly two stages, `--serve`. In the config:
   (`--expert-cache-device1..3`, `--remote-expert-opt`), a split into three or more stages or onto one GPU
   (`--split-device 0`), or no draft layer. A request with repetition penalties (`penalty_last_n`) or coupled
   draft sampling decodes serially.
+- **With the resident RAM mode's asynchronous swaps** (`--adapt-async 1`, [DETAILS.md](DETAILS.md)) a round's steps
+  advance between the verified windows. Each card's copies are queued by the decode loop itself while that card has
+  no window in flight, after every window that may still read what they overwrite has finished; the moves into RAM
+  wait the same way.
 - **Measured** (Swift 1.5 IQ3_XXS, 160K context, q4_0 KV, the stock draft layer, RTX 4060 Ti (layers 0-19) +
   RTX 5080 (20-47), i9-14900KF, 32 GB of RAM with the resident RAM mode on the split (#848); greedy, 500 tokens, two
   interleaved pairs of three rounds, decode tok/s): Python code 90.4 -> 103.1, C code 76.6 -> 81.6, English prose
@@ -231,8 +235,9 @@ Two cards, exactly two stages, `--serve`. In the config:
   (`--mmap-experts` on that 32 GB PC) the file reads dominate and it measured no faster.
 
 The `STRATA_PIPELINE_*` tuning and test variables (THETA, FORCE_MISS, SWITCH, LOG, TRACE and the like) are read only with
-`STRATA_PIPELINE_DEBUG=1`. `--pipeline-windows` and `--adapt-async 1` exclude each other (the engine says so and keeps the
-pipeline).
+`STRATA_PIPELINE_DEBUG=1`. `--adapt-async 1` runs beside `--pipeline-windows 2` (`STRATA_PIPELINE_ADAPT_ASYNC=0` keeps
+the blocking tier there); `--pipeline-windows 1` and `--adapt-async 1` exclude each other (the engine says so and keeps
+the pipeline).
 
 ## Several conversations at once
 

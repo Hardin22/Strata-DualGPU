@@ -2754,6 +2754,13 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             }
             if (now - fl_since_ms_ > 20000.0) {   // #267: no spin kernel may outlive the engine
                 trace_ev("TIMEOUT", fl_k_, l, 0);
+                if (g_trace) {   // as run(): the words and the breadcrumbs before the release, and after it
+                    diag(stderr);
+                    const bool drained = release_gpu_waits(5000);
+                    trace_dump(stderr);
+                    err = "verify: timed out at layer " + std::to_string(l) + released_note(drained);
+                    return -1;
+                }
                 err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
                 return -1;
             }
